@@ -1,0 +1,19 @@
+# Environment secrets
+.env
+
+# Google session cookies
+cookies/*.txt
+
+# Ollama runtime data (keys + model weights, auto-downloaded)
+ollama_data/
+
+# TTS model cache (auto-downloaded on first run)
+tts_cache/
+
+# Python
+__pycache__/
+*.pyc
+
+# Local tool config
+.agent
+.claude/

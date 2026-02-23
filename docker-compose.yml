@@ -1,0 +1,79 @@
+version: '3.8'
+services:
+  # --- THE MIND ---
+  ollama:
+    image: ollama/ollama
+    container_name: herald_mind
+    expose: ["11434"]
+    volumes:
+      - ./ollama_data:/root/.ollama
+    # Auto-pull the model on start
+    entrypoint: /bin/sh
+    command: -c "ollama serve & sleep 5 && ollama pull qwen2.5:3b && wait"
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+    networks: [herald_net]
+    # GPU reservation removed for CPU fallback
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+  # --- THE NERVE ENDING (TEST NODE) ---
+  node01:
+    build: ./nodes
+    container_name: herald_node01
+    environment:
+      - MEET_URL=${MEET_URL_01}
+    volumes:
+      # Mount the specific cookie file for this node (Still useful for backup)
+      - ./cookies/herald_node01.txt:/app/cookies/herald_node01.txt
+      # Persistent Chrome Profile for Red Phone Logic
+      - herald_chrome_data:/app/chrome_profile
+      - /dev/shm:/dev/shm
+    expose: ["4713"]
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+    networks: [herald_net]
+
+  # --- THE CORTEX ---
+  cortex:
+    build: ./cortex
+    container_name: herald_cortex
+    depends_on: [ollama, node01]
+    volumes:
+      # Mount the Voice Sample
+      - ./voice_sample/reference.wav:/app/voice/reference.wav
+      # Mount Server Cookies (Optional/Future Use)
+      - ./cookies/herald_server.txt:/app/cookies/herald_server.txt
+      # Persist TTS Models
+      - ./tts_cache:/root/.local/share/tts
+    ports: ["5000:5000"]
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+    environment:
+      - HERALD_NODES=Node01|herald_node01|4713
+      - COQUI_TOS_AGREED=1
+    # GPU reservation removed for CPU fallback
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+    networks: [herald_net]
+
+networks:
+  herald_net:
+    driver: bridge
+
+volumes:
+  herald_chrome_data:
+
