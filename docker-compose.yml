@@ -4,6 +4,7 @@ services:
   ollama:
     image: ollama/ollama
     container_name: herald_mind
+    profiles: ["local-llm"]
     expose: ["11434"]
     volumes:
       - ./ollama_data:/root/.ollama
@@ -45,7 +46,7 @@ services:
   cortex:
     build: ./cortex
     container_name: herald_cortex
-    depends_on: [ollama, node01]
+    depends_on: [node01]
     volumes:
       # Mount the Voice Sample
       - ./voice_sample/reference.wav:/app/voice/reference.wav
@@ -60,6 +61,8 @@ services:
     environment:
       - HERALD_NODES=Node01|herald_node01|4713
       - COQUI_TOS_AGREED=1
+      - LLM_URL=${LLM_URL:-http://ollama:11434/api/chat}
+      - LLM_MODEL=${LLM_MODEL:-qwen2.5:3b}
     # GPU reservation removed for CPU fallback
     # deploy:
     #   resources:

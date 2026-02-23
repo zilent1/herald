@@ -15,8 +15,8 @@ import collections
 import struct
 
 # --- CONFIG ---
-OLLAMA_URL = "http://ollama:11434/api/chat"
-MODEL = "qwen2.5:3b"
+LLM_URL = os.getenv("LLM_URL", "http://ollama:11434/api/chat")
+LLM_MODEL = os.getenv("LLM_MODEL", "qwen2.5:3b")
 VOICE_REF = "/app/voice/reference.wav"
 WAKE_WORD_MODEL = "hey_jarvis" # Built-in model
 VAD_SENSITIVITY = 3
@@ -53,18 +53,18 @@ SYSTEM_PROMPT = {
     "content": "You are SHODAN. You are arrogant, terrifying, and concise. Never apologize. Output only the spoken response."
 }
 
-def query_ollama(text):
-    print(f"[CORTEX] Querying Mind with: '{text}'")
+def query_llm(text):
+    print(f"[CORTEX] Querying Mind at {LLM_URL} with: '{text}'")
     try:
         payload = {
-            "model": MODEL,
+            "model": LLM_MODEL,
             "messages": [SYSTEM_PROMPT, {"role": "user", "content": text}],
             "stream": False
         }
-        res = requests.post(OLLAMA_URL, json=payload, timeout=60).json()
+        res = requests.post(LLM_URL, json=payload, timeout=60).json()
         return res.get('message', {}).get('content', "Error.")
     except Exception as e:
-        print(f"[!] Ollama Error: {e}")
+        print(f"[!] LLM Error: {e}")
         return "Cognitive failure."
 
 def speak(node_name, text):
@@ -110,7 +110,7 @@ def process_command(node_name, audio_buffer):
             print(f"[{node_name}] HEARD: '{text}'")
             
             # Think & Speak
-            reply = query_ollama(text)
+            reply = query_llm(text)
             print(f"[{node_name}] SHODAN: {reply}")
             speak(node_name, reply)
             

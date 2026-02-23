@@ -9,6 +9,7 @@ BASE_OLLAMA = """
   ollama:
     image: ollama/ollama
     container_name: herald_mind
+    profiles: ["local-llm"]
     expose: ["11434"]
     volumes:
       - ./ollama_data:/root/.ollama
@@ -26,7 +27,6 @@ BASE_CORTEX = """
   cortex:
     build: ./cortex
     container_name: herald_cortex
-    depends_on: [ollama]
     volumes:
       # Mount the Voice Sample
       - ./voice_sample/reference.wav:/app/voice/reference.wav
@@ -37,6 +37,8 @@ BASE_CORTEX = """
     ports: ["5000:5000"]
     environment:
       - HERALD_NODES={herald_nodes_env}
+      - LLM_URL=${{LLM_URL:-http://ollama:11434/api/chat}}
+      - LLM_MODEL=${{LLM_MODEL:-qwen2.5:3b}}
     networks: [herald_net]
 """
 
