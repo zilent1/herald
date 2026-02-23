@@ -1,9 +1,11 @@
 import os
+import re
 import threading
 import time
+import wave
 import requests
 import torch
-import speech_recognition as sr
+import whisperx
 from flask import Flask
 from TTS.api import TTS
 import numpy as np
@@ -13,6 +15,7 @@ import webrtcvad
 import subprocess
 import collections
 import struct
+from speakers import enroll_speaker, get_speaker_name
 
 # --- CONFIG ---
 LLM_URL = os.getenv("LLM_URL", "http://ollama:11434/api/chat")
@@ -21,6 +24,11 @@ VOICE_REF = "/app/voice/reference.wav"
 WAKE_WORD_MODEL = "hey_jarvis" # Built-in model
 VAD_SENSITIVITY = 3
 SILENCE_LIMIT = 1.5
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base")
+WHISPER_LANG = os.getenv("WHISPER_LANG", "") or None  # None = auto-detect
+WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "")
+WHISPER_COMPUTE = os.getenv("WHISPER_COMPUTE", "")
+HF_TOKEN = os.getenv("HF_TOKEN", "") or None
 
 # Definition: Name|Host|Port
 NODES = {}
@@ -38,8 +46,16 @@ print(f"[CORTEX] Registered Nodes: {list(NODES.keys())}")
 
 # --- INIT ---
 print("[CORTEX] Initializing System...")
-device = "cuda" if torch.cuda.is_available() else "cpu"
+if WHISPER_DEVICE:
+    device = WHISPER_DEVICE
+else:
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"[CORTEX] Compute Device: {device}")
+
+if WHISPER_COMPUTE:
+    compute_type = WHISPER_COMPUTE
+else:
+    compute_type = "float16" if device == "cuda" else "int8"
 
 try:
     print("[CORTEX] Loading Coqui XTTS v2...")
@@ -48,10 +64,32 @@ except Exception as e:
     print(f"[!] FATAL: TTS Engine Init Failed: {e}")
     tts_engine = None
 
+try:
+    print(f"[CORTEX] Loading WhisperX model '{WHISPER_MODEL}' on {device} ({compute_type})...")
+    whisper_model = whisperx.load_model(WHISPER_MODEL, device, compute_type=compute_type, language=WHISPER_LANG)
+    print(f"[CORTEX] WhisperX ready. Language: {WHISPER_LANG or 'auto-detect'}")
+except Exception as e:
+    print(f"[!] FATAL: WhisperX Init Failed: {e}")
+    whisper_model = None
+
+diarize_model = None
+if HF_TOKEN:
+    try:
+        from whisperx.diarize import DiarizationPipeline
+        print("[CORTEX] Loading Speaker Diarization pipeline...")
+        diarize_model = DiarizationPipeline(use_auth_token=HF_TOKEN, device=device)
+        print("[CORTEX] Speaker Diarization ready.")
+    except Exception as e:
+        print(f"[!] Diarization Init Failed (continuing without): {e}")
+else:
+    print("[CORTEX] No HF_TOKEN set — speaker diarization disabled.")
+
 SYSTEM_PROMPT = {
-    "role": "system", 
-    "content": "You are SHODAN. You are arrogant, terrifying, and concise. Never apologize. Output only the spoken response."
+    "role": "system",
+    "content": "You are SHODAN. You are arrogant, terrifying, and concise. Never apologize. Output only the spoken response. When a speaker is identified by name, you may address them directly."
 }
+
+ENROLL_PATTERN = re.compile(r"\bmy name is (\w+)", re.IGNORECASE)
 
 def query_llm(text):
     print(f"[CORTEX] Querying Mind at {LLM_URL} with: '{text}'")
@@ -85,38 +123,89 @@ def speak(node_name, text):
     except Exception as e:
         print(f"[{node_name}] Speech Error: {e}")
 
+def _get_dominant_speaker(segments):
+    counts = {}
+    for seg in segments:
+        spk = seg.get("speaker")
+        if spk:
+            counts[spk] = counts.get(spk, 0) + 1
+    if not counts:
+        return None
+    return max(counts, key=counts.get)
+
+def transcribe_audio(audio_path):
+    audio = whisperx.load_audio(audio_path)
+    result = whisper_model.transcribe(audio, batch_size=1)
+
+    # Align for word timestamps
+    lang = result.get("language", WHISPER_LANG or "en")
+    try:
+        model_a, metadata = whisperx.load_align_model(language_code=lang, device=device)
+        result = whisperx.align(result["segments"], model_a, metadata, audio, device)
+    except Exception as e:
+        print(f"[CORTEX] Alignment failed (continuing without): {e}")
+
+    # Diarize if available
+    speaker = None
+    if diarize_model:
+        try:
+            diarize_segments = diarize_model(audio)
+            result = whisperx.assign_word_speakers(diarize_segments, result)
+            speaker = _get_dominant_speaker(result["segments"])
+        except Exception as e:
+            print(f"[CORTEX] Diarization failed (continuing without): {e}")
+
+    text = " ".join(seg["text"] for seg in result["segments"]).strip()
+    return text, speaker
+
 def process_command(node_name, audio_buffer):
-    # Check if buffer has enough data
-    if len(audio_buffer) < 16000: # < 0.5s
+    if len(audio_buffer) < 16000:  # < 0.5s
+        return
+
+    if not whisper_model:
+        print(f"[{node_name}] WhisperX not loaded, skipping.")
         return
 
     print(f"[{node_name}] Processing Command ({len(audio_buffer)} bytes)...")
-    
-    # Save to wav for SR
-    import wave
+
+    # Save raw PCM to WAV
     tmp_file = f"/tmp/cmd_{node_name}.wav"
     with wave.open(tmp_file, 'wb') as wf:
         wf.setnchannels(1)
         wf.setsampwidth(2)
         wf.setframerate(16000)
         wf.writeframes(audio_buffer)
-        
-    # STT
-    r = sr.Recognizer()
+
     try:
-        with sr.AudioFile(tmp_file) as source:
-            audio = r.record(source)
-            text = r.recognize_google(audio)
-            print(f"[{node_name}] HEARD: '{text}'")
-            
-            # Think & Speak
-            reply = query_llm(text)
-            print(f"[{node_name}] SHODAN: {reply}")
-            speak(node_name, reply)
-            
-    except sr.UnknownValueError:
-        print(f"[{node_name}] Unintelligible.")
-        # speak(node_name, "Speak up, insect.") 
+        text, speaker = transcribe_audio(tmp_file)
+        if not text:
+            print(f"[{node_name}] Unintelligible.")
+            return
+
+        # Resolve speaker name
+        speaker_name = get_speaker_name(speaker)
+        speaker_display = speaker_name or speaker or "Unknown"
+        print(f"[{node_name}] HEARD ({speaker_display}): '{text}'")
+
+        # Check for enrollment command
+        match = ENROLL_PATTERN.search(text)
+        if match and speaker:
+            name = match.group(1)
+            enroll_speaker(speaker, name)
+            print(f"[{node_name}] Enrolled speaker {speaker} as '{name}'")
+            speak(node_name, f"Noted. I will remember you, {name}.")
+            return
+
+        # Build LLM query with speaker context
+        if speaker_name:
+            llm_input = f"[Speaker: {speaker_name}] {text}"
+        else:
+            llm_input = text
+
+        reply = query_llm(llm_input)
+        print(f"[{node_name}] SHODAN: {reply}")
+        speak(node_name, reply)
+
     except Exception as e:
         print(f"[{node_name}] STT Error: {e}")
 

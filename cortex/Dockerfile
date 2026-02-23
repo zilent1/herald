@@ -16,5 +16,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY core.py .
+COPY speakers.py .
+RUN mkdir -p /app/data
 
 CMD ["python", "core.py"]

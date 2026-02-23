@@ -1,8 +1,8 @@
 TTS
-torch==2.1.2
-torchaudio==2.1.2
-transformers==4.36.2
-SpeechRecognition
+torch
+torchaudio
+transformers
+whisperx
 requests
 flask
 pydub

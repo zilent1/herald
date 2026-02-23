@@ -14,8 +14,9 @@ H.E.R.A.L.D. hijacks Google Meet calls to bridge audio between Nest Mini speaker
   Nest Mini           Node (Docker)              Cortex                  Ollama
  +---------+     +------------------+     +------------------+     +-----------+
  | Speaker | <-> | Chrome + Meet    | <-> | Wake Word (OWW)  | --> | qwen2.5:3b|
- |         |     | PulseAudio TCP   |     | STT (Google)     |     | (SHODAN)  |
+ |         |     | PulseAudio TCP   |     | STT (WhisperX)   |     | (SHODAN)  |
  +---------+     +------------------+     | TTS (XTTS v2)    |     +-----------+
+                                          | Speaker ID       |
                                           +------------------+
                     Audio over TCP:4713
 ```
@@ -23,7 +24,8 @@ H.E.R.A.L.D. hijacks Google Meet calls to bridge audio between Nest Mini speaker
 1. **Nodes** join a Google Meet call to each Nest Mini using headless Chrome
 2. **Cortex** taps into each node's audio stream via PulseAudio TCP
 3. On hearing "Hey Jarvis", it records until silence is detected (WebRTC VAD)
-4. Speech is transcribed, sent to the local LLM, and the response is spoken back through the Nest Mini using a voice-cloned TTS engine
+4. Speech is transcribed locally via WhisperX, optionally identifying the speaker via diarization
+5. The transcript (with speaker context) is sent to the local LLM, and the response is spoken back through the Nest Mini using a voice-cloned TTS engine
 
 ## Architecture
 
@@ -31,7 +33,7 @@ H.E.R.A.L.D. hijacks Google Meet calls to bridge audio between Nest Mini speaker
 |---|---|---|
 | **Mind** | `herald_mind` | Ollama instance running `qwen2.5:3b` with a SHODAN system prompt |
 | **Nodes** | `herald_node01`, `...` | Headless Chrome containers that join Meet calls and expose audio via PulseAudio TCP |
-| **Cortex** | `herald_cortex` | Central brain — wake word detection, STT, LLM queries, TTS, audio routing |
+| **Cortex** | `herald_cortex` | Central brain — wake word detection, STT (WhisperX), speaker identification, LLM queries, TTS, audio routing |
 
 ### Audio Pipeline
 
@@ -60,6 +62,7 @@ herald/
 +-- .env                       # Meet room URLs
 +-- cortex/
 |   +-- core.py                # Central brain (wake word -> STT -> LLM -> TTS)
+|   +-- speakers.py            # Speaker enrollment persistence
 |   +-- Dockerfile
 |   +-- requirements.txt
 +-- nodes/
@@ -75,6 +78,8 @@ herald/
 |   +-- reference.wav          # Voice clone source for TTS
 +-- tts_cache/                 # Persisted Coqui XTTS v2 model files
 +-- ollama_data/               # Persisted Ollama model weights
++-- whisper_cache/             # Persisted WhisperX / HuggingFace models
++-- speaker_data/              # Speaker enrollment data (speakers.json)
 ```
 
 ## Setup
@@ -125,11 +130,92 @@ python scripts/generate_deployment.py
 
 ### 6. Build and Run
 
+**With the bundled Ollama container:**
+
 ```bash
-docker-compose up --build -d
+docker compose --profile local-llm up --build -d
 ```
 
 On first run, Ollama will pull the `qwen2.5:3b` model and Coqui will download XTTS v2 weights. These are cached in `ollama_data/` and `tts_cache/` respectively.
+
+**With an external LLM:** see [Using an External LLM](#using-an-external-llm) below.
+
+## Using an External LLM
+
+By default, H.E.R.A.L.D. ships with a bundled Ollama container. You can skip it entirely and point Cortex at any Ollama-compatible API instead.
+
+Set `LLM_URL` and `LLM_MODEL` in your `.env` file:
+
+```
+LLM_URL=http://192.168.1.100:11434/api/chat
+LLM_MODEL=llama3:8b
+```
+
+Then start without the `local-llm` profile — the Ollama container won't be created:
+
+```bash
+docker compose up --build -d
+```
+
+| Mode | Command | `.env` vars needed? |
+|---|---|---|
+| Bundled Ollama | `docker compose --profile local-llm up` | No (defaults work) |
+| External LLM | `docker compose up` | Yes — `LLM_URL` and `LLM_MODEL` |
+
+The external endpoint must expose the [Ollama `/api/chat`](https://github.com/ollama/ollama/blob/main/docs/api.md#generate-a-chat-completion) interface. Any server that implements it (Ollama, LiteLLM, LocalAI, etc.) will work.
+
+## Speech Recognition (WhisperX)
+
+Cortex uses [WhisperX](https://github.com/m-bain/whisperX) for fully local, offline speech-to-text. All transcription runs inside the container — no audio is sent to external services.
+
+### Configuration
+
+All settings are optional. Defaults work out of the box on CPU with English auto-detection.
+
+| Variable | Default | Description |
+|---|---|---|
+| `WHISPER_MODEL` | `base` | Whisper model to load. Options: `tiny`, `base`, `small`, `medium`, `large-v3`, or any HuggingFace model ID (e.g., `Berly00/whisper-small-portuguese-1`) |
+| `WHISPER_LANG` | *(auto-detect)* | Force a language code (e.g., `pt`, `en`, `es`). Leave empty for auto-detection. |
+| `WHISPER_DEVICE` | *(auto)* | Force `cuda` or `cpu`. Leave empty to auto-detect via `torch.cuda.is_available()`. |
+| `WHISPER_COMPUTE` | *(auto)* | Compute type: `float16` (GPU), `int8` (CPU), or `float32`. Auto-selects based on device if empty. |
+
+Example `.env` for Portuguese on GPU:
+
+```
+WHISPER_MODEL=small
+WHISPER_LANG=pt
+WHISPER_DEVICE=cuda
+WHISPER_COMPUTE=float16
+```
+
+The non-suffixed models (`base`, `small`, etc.) are multilingual and support Portuguese, English, and 90+ other languages. The `.en` suffixed models (e.g., `base.en`) are English-only but slightly more accurate for English.
+
+WhisperX models are downloaded on first run and cached in `whisper_cache/`.
+
+## Speaker Identification
+
+Cortex can identify **who** is speaking using [pyannote-audio](https://github.com/pyannote/pyannote-audio) speaker diarization, integrated via WhisperX. This is optional and requires a free HuggingFace account.
+
+### Setup
+
+1. Create an account at [huggingface.co](https://huggingface.co)
+2. Accept the user agreements for [pyannote/speaker-diarization](https://huggingface.co/pyannote/speaker-diarization) and [pyannote/segmentation](https://huggingface.co/pyannote/segmentation)
+3. Generate a read-access token from your [HuggingFace settings](https://huggingface.co/settings/tokens)
+4. Add it to your `.env`:
+
+```
+HF_TOKEN=hf_your_token_here
+```
+
+If `HF_TOKEN` is not set, diarization is disabled and transcription works normally without speaker labels.
+
+### Speaker Enrollment
+
+When diarization is enabled, speakers are identified by anonymous labels (`SPEAKER_00`, `SPEAKER_01`, etc.). You can teach the system your name by saying:
+
+> "Hey Jarvis, my name is John"
+
+The system will associate the diarization label with the name `John` and persist it in `speaker_data/speakers.json`. On subsequent interactions, the speaker's name is passed to the LLM so it can address them directly.
 
 ## Usage
 
@@ -169,7 +255,8 @@ docker exec herald_node01 pulseaudio -k && docker restart herald_node01
 |---|---|
 | LLM | Ollama + Qwen 2.5 3B |
 | TTS | Coqui XTTS v2 (voice cloning) |
-| STT | Google Web Speech API via SpeechRecognition |
+| STT | WhisperX (local, offline) |
+| Speaker ID | pyannote-audio via WhisperX (optional, requires HuggingFace token) |
 | Wake Word | OpenWakeWord ("hey_jarvis" model, ONNX) |
 | VAD | WebRTC VAD |
 | Browser | undetected-chromedriver + Selenium |

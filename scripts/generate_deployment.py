@@ -34,11 +34,20 @@ BASE_CORTEX = """
       - ./cookies/herald_server.txt:/app/cookies/herald_server.txt
       # Persist TTS Models
       - ./tts_cache:/root/.local/share/tts
+      # Speaker enrollment data
+      - ./speaker_data:/app/data
+      # WhisperX / HuggingFace model cache
+      - ./whisper_cache:/root/.cache/huggingface
     ports: ["5000:5000"]
     environment:
       - HERALD_NODES={herald_nodes_env}
       - LLM_URL=${{LLM_URL:-http://ollama:11434/api/chat}}
       - LLM_MODEL=${{LLM_MODEL:-qwen2.5:3b}}
+      - WHISPER_MODEL=${{WHISPER_MODEL:-base}}
+      - WHISPER_LANG=${{WHISPER_LANG:-}}
+      - WHISPER_DEVICE=${{WHISPER_DEVICE:-}}
+      - WHISPER_COMPUTE=${{WHISPER_COMPUTE:-}}
+      - HF_TOKEN=${{HF_TOKEN:-}}
     networks: [herald_net]
 """
 
