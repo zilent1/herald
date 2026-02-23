@@ -1,5 +1,7 @@
 # H.E.R.A.L.D.
 
+> **Note:** This project is a prototype and a work in progress. Expect rough edges, breaking changes, and incomplete features.
+
 **Heuristic Entity for Real-time Audio Linkage and Distribution**
 
 A self-hosted, AI-powered facility intercom system that turns Google Nest Mini speakers into nodes of a voice-activated assistant — powered by a local LLM with a SHODAN personality.
