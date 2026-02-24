@@ -1,7 +1,10 @@
 FROM python:3.10-slim-bullseye
 
 # Install Audio Subsystem
-RUN apt-get update && apt-get install -y pulseaudio pulseaudio-utils libasound2 alsa-utils wget gnupg unzip xvfb
+RUN apt-get update && apt-get install -y pulseaudio pulseaudio-utils libasound2 alsa-utils wget gnupg unzip xvfb \
+    x11vnc \
+    novnc \
+    websockify
 
 # Install Chrome
 RUN wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | apt-key add - \
@@ -40,6 +43,8 @@ ENV DISPLAY=:99
 
 # TCP Audio Port
 EXPOSE 4713
+# noVNC WebSocket Port
+EXPOSE 6080
 
 # Use the entrypoint script
 CMD ["/app/entrypoint.sh"]

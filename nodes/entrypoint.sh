@@ -9,6 +9,12 @@ Xvfb :99 -screen 0 1280x1024x24 &
 export DISPLAY=:99
 sleep 1
 
+if [ "${NOVNC_ENABLED}" = "1" ]; then
+    echo "[HERALD] Starting noVNC on port 6080..."
+    x11vnc -display :99 -forever -nopw -rfbport 5900 -shared -bg -o /tmp/x11vnc.log
+    websockify --daemon --web /usr/share/novnc 6080 localhost:5900
+fi
+
 echo "[ENTRYPOINT] Starting PulseAudio (Debug Mode)..."
 # Run in foreground (backgrounded) with moderate verbosity
 pulseaudio --daemonize=no --exit-idle-time=-1 --log-target=stderr -v &

@@ -281,6 +281,44 @@ deploy:
 
 Requires the NVIDIA Container Toolkit to be installed on the host.
 
+
+## Debugging with noVNC
+
+Each node container runs headless Chrome on a virtual display (`Xvfb :99`). noVNC lets you view that display live in a browser — useful for debugging Selenium automation without needing a VNC client.
+
+### How to enable
+
+Generate the compose file with the `--novnc` flag:
+
+```bash
+python scripts/generate_deployment.py --novnc
+```
+
+Then start as normal:
+
+```bash
+docker compose up --build
+```
+
+### Port scheme
+
+Each node exposes its noVNC interface on a unique host port derived from its node ID:
+
+| Node | URL |
+|---|---|
+| `node01` | `http://<host>:6801/vnc.html` |
+| `node02` | `http://<host>:6802/vnc.html` |
+
+### How it works
+
+1. `x11vnc` attaches to the Xvfb display (`:99`) and serves VNC on port `5900`
+2. `websockify` proxies VNC → WebSocket on port `6080`, serving the noVNC static files
+3. The host binds `680<id>` → container port `6080`
+
+### Security note
+
+noVNC has no password and no authentication. It is a development tool only. **Do not expose these ports publicly.**
+
 ## Network
 
 All containers communicate over a private `herald_net` bridge network. Only the Cortex health check endpoint (port 5000) is exposed to the host. PulseAudio TCP (port 4713) is internal only.

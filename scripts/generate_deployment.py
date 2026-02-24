@@ -61,21 +61,21 @@ NODE_TEMPLATE = """
       - ESP_IP={esp_ip}
       - MEET_URL={meet_url}
       # Generic paths inside container, mapped via volumes
-      - COOKIE_FILE=/app/cookies/auth.txt
+      - COOKIE_FILE=/app/cookies/auth.txt{novnc_env}
     volumes:
       # Mount the specific cookie file for this node
       - ./cookies/{cookie_file}:/app/cookies/auth.txt
       # Persistent Chrome Profile for Red Phone Logic (Unique Volume)
       - herald_chrome_profile_{id}:/app/chrome_profile
       - /dev/shm:/dev/shm
-    expose: ["4713"]
+    expose: ["4713"]{novnc_ports}
     dns:
       - 8.8.8.8
       - 8.8.4.4
     networks: [herald_net]
 """
 
-def generate():
+def generate(novnc=False):
     if not os.path.exists(CONFIG_FILE):
         print(f"[!] Config file {CONFIG_FILE} not found.")
         return
@@ -91,11 +91,19 @@ def generate():
     for node in nodes_config:
         nid = node['id']
         # 1. Add Service Block
+        if novnc:
+            novnc_env = "\n      - NOVNC_ENABLED=1"
+            novnc_ports = f"\n    ports:\n      - \"68{nid}:6080\""
+        else:
+            novnc_env = ""
+            novnc_ports = ""
         services_yaml += NODE_TEMPLATE.format(
             id=nid,
             esp_ip=node['esp_ip'],
             meet_url=node.get('meet_url', 'https://meet.google.com/calling/'),
-            cookie_file=node['cookie_file']
+            cookie_file=node['cookie_file'],
+            novnc_env=novnc_env,
+            novnc_ports=novnc_ports
         )
         # 2. Add Volume Declaration
         volumes_yaml += f"  herald_chrome_profile_{nid}:\n"
@@ -135,4 +143,8 @@ networks:
     print(f"[+] Generated {OUTPUT_FILE} with {len(nodes_config)} nodes.")
 
 if __name__ == "__main__":
-    generate()
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--novnc", action="store_true", help="Enable noVNC on port 680<id> per node")
+    args = parser.parse_args()
+    generate(novnc=args.novnc)

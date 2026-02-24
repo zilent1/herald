@@ -1,5 +1,6 @@
 version: '3.8'
 services:
+
   # --- THE MIND ---
   ollama:
     image: ollama/ollama
@@ -15,26 +16,23 @@ services:
       - 8.8.8.8
       - 8.8.4.4
     networks: [herald_net]
-    # GPU reservation removed for CPU fallback
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           count: 1
-    #           capabilities: [gpu]
 
-  # --- THE NERVE ENDING (TEST NODE) ---
+
+  # --- NODE 01 ---
   node01:
     build: ./nodes
     container_name: herald_node01
     environment:
-      - MEET_URL=${MEET_URL_01}
+      - NODE_ID=Node01
+      - ESP_IP=192.168.1.155
+      - MEET_URL=https://meet.google.com/calling/
+      # Generic paths inside container, mapped via volumes
+      - COOKIE_FILE=/app/cookies/auth.txt
     volumes:
-      # Mount the specific cookie file for this node (Still useful for backup)
-      - ./cookies/herald_node01.txt:/app/cookies/herald_node01.txt
-      # Persistent Chrome Profile for Red Phone Logic
-      - herald_chrome_data:/app/chrome_profile
+      # Mount the specific cookie file for this node
+      - ./cookies/herald_node01.txt:/app/cookies/auth.txt
+      # Persistent Chrome Profile for Red Phone Logic (Unique Volume)
+      - herald_chrome_profile_01:/app/chrome_profile
       - /dev/shm:/dev/shm
     expose: ["4713"]
     dns:
@@ -42,11 +40,11 @@ services:
       - 8.8.4.4
     networks: [herald_net]
 
+
   # --- THE CORTEX ---
   cortex:
     build: ./cortex
     container_name: herald_cortex
-    depends_on: [node01]
     volumes:
       # Mount the Voice Sample
       - ./voice_sample/reference.wav:/app/voice/reference.wav
@@ -59,12 +57,8 @@ services:
       # WhisperX / HuggingFace model cache
       - ./whisper_cache:/root/.cache/huggingface
     ports: ["5000:5000"]
-    dns:
-      - 8.8.8.8
-      - 8.8.4.4
     environment:
-      - HERALD_NODES=Node01|herald_node01|4713
-      - COQUI_TOS_AGREED=1
+      - HERALD_NODES=Node01|node01|4713
       - LLM_URL=${LLM_URL:-http://ollama:11434/api/chat}
       - LLM_MODEL=${LLM_MODEL:-qwen2.5:3b}
       - WHISPER_MODEL=${WHISPER_MODEL:-base}
@@ -72,20 +66,14 @@ services:
       - WHISPER_DEVICE=${WHISPER_DEVICE:-}
       - WHISPER_COMPUTE=${WHISPER_COMPUTE:-}
       - HF_TOKEN=${HF_TOKEN:-}
-    # GPU reservation removed for CPU fallback
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           count: 1
-    #           capabilities: [gpu]
     networks: [herald_net]
+
 
 networks:
   herald_net:
     driver: bridge
 
+
 volumes:
-  herald_chrome_data:
+  herald_chrome_profile_01:
 
