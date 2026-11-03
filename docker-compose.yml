@@ -1,10 +1,10 @@
-version: '3.8'
 services:
 
   # --- THE MIND ---
   ollama:
     image: ollama/ollama
     container_name: herald_mind
+    restart: unless-stopped
     profiles: ["local-llm"]
     expose: ["11434"]
     volumes:
@@ -22,10 +22,12 @@ services:
   node01:
     build: ./nodes
     container_name: herald_node01
+    restart: unless-stopped
+    shm_size: "2gb"
     environment:
       - NODE_ID=Node01
       - ESP_IP=192.168.1.155
-      - MEET_URL=https://meet.google.com/calling/
+      - MEET_URL=${MEET_URL_01:-https://meet.google.com/calling/}
       # Generic paths inside container, mapped via volumes
       - COOKIE_FILE=/app/cookies/auth.txt
     volumes:
@@ -33,7 +35,6 @@ services:
       - ./cookies/herald_node01.txt:/app/cookies/auth.txt
       # Persistent Chrome Profile for Red Phone Logic (Unique Volume)
       - herald_chrome_profile_01:/app/chrome_profile
-      - /dev/shm:/dev/shm
     expose: ["4713"]
     dns:
       - 8.8.8.8
@@ -45,18 +46,17 @@ services:
   cortex:
     build: ./cortex
     container_name: herald_cortex
+    restart: unless-stopped
     volumes:
       # Mount the Voice Sample
       - ./voice_sample/reference.wav:/app/voice/reference.wav
-      # Mount Server Cookies (Optional/Future Use)
-      - ./cookies/herald_server.txt:/app/cookies/herald_server.txt
       # Persist TTS Models
       - ./tts_cache:/root/.local/share/tts
       # Speaker enrollment data
       - ./speaker_data:/app/data
-      # WhisperX / HuggingFace model cache
-      - ./whisper_cache:/root/.cache/huggingface
-    ports: ["5000:5000"]
+      # Model cache: WhisperX, torch alignment, pyannote
+      - ./whisper_cache:/root/.cache
+    ports: ["${CORTEX_BIND:-127.0.0.1}:5000:5000"]
     environment:
       - HERALD_NODES=Node01|node01|4713
       - LLM_URL=${LLM_URL:-http://ollama:11434/api/chat}
@@ -66,6 +66,16 @@ services:
       - WHISPER_DEVICE=${WHISPER_DEVICE:-}
       - WHISPER_COMPUTE=${WHISPER_COMPUTE:-}
       - HF_TOKEN=${HF_TOKEN:-}
+      - TTS_LANG=${TTS_LANG:-}
+      - SPEAKER_ID=${SPEAKER_ID:-}
+      - SPEAKER_THRESHOLD=${SPEAKER_THRESHOLD:-0.6}
+      - HISTORY_TURNS=${HISTORY_TURNS:-6}
+      - HISTORY_TTL=${HISTORY_TTL:-300}
+      - MAX_COMMAND_SECONDS=${MAX_COMMAND_SECONDS:-15}
+      - VAD_MODE=${VAD_MODE:-2}
+      - COMMAND_START_TIMEOUT=${COMMAND_START_TIMEOUT:-3}
+    depends_on:
+      - node01
     networks: [herald_net]
 
 

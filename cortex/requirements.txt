@@ -1,12 +1,16 @@
-TTS
-torch
-torchaudio
-transformers
-whisperx
+# Pinned: unpinned installs resolve torch/torchaudio pairs that break
+# pyannote.audio 3.x (torchaudio>=2.9 dropped AudioMetaData) and
+# transformers>=4.50 breaks Coqui XTTS (GPT2InferenceModel.generate).
+torch==2.5.1
+torchaudio==2.5.1
+transformers==4.46.3
+TTS==0.22.0
+whisperx==3.3.1
+pyannote.audio==3.3.2
 requests
 flask
 pydub
-numpy
+numpy==1.22.0
 scipy
 openwakeword
 onnxruntime

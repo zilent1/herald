@@ -1,4 +1,4 @@
-FROM python:3.10-slim-bullseye
+FROM python:3.10-slim-bookworm
 
 WORKDIR /app
 
@@ -14,9 +14,12 @@ RUN apt-get update && apt-get install -y \
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+# openWakeWord >= 0.5 ships without model files: fetch the wake word + feature models at build time
+RUN python -c "import openwakeword.utils as u; u.download_models(['hey_jarvis'])"
 
 COPY core.py .
 COPY speakers.py .
 RUN mkdir -p /app/data
 
+ENV PYTHONUNBUFFERED=1
 CMD ["python", "core.py"]

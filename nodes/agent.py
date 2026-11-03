@@ -11,9 +11,88 @@ PROFILE_PATH = "/app/chrome_profile"
 ESP_IP = os.getenv("ESP_IP") # The D1 Mini's IP address
 REDIAL_URL = f"http://{ESP_IP}/shout" if ESP_IP else None
 CALLING_URL = os.getenv("MEET_URL", "https://meet.google.com/calling/") 
+COOKIE_FILE = os.getenv('COOKIE_FILE')
+LOGIN_RETRY_SECONDS = int(os.getenv('LOGIN_RETRY_SECONDS', '300'))
 
 # --- AUDIO SETUP ---
 # Handled by entrypoint.sh
+
+def load_netscape_cookies(path):
+    """Parse a Netscape-format cookies file. Returns list of cookie dicts."""
+    if not os.path.isfile(path):
+        return []
+    cookies = []
+    with open(path, 'r') as f:
+        for line in f:
+            line = line.rstrip('\r\n')
+            if not line or line.isspace():
+                continue
+            http_only = False
+            if line.startswith('#HttpOnly_'):
+                http_only = True
+                line = line[len('#HttpOnly_'):]
+            elif line.startswith('#'):
+                continue
+            fields = line.split('\t')
+            if len(fields) < 7:
+                continue
+            domain, include_subdomains, cpath, secure, expiry, name, value = fields[:7]
+            cookie = {
+                'domain': domain,
+                'path': cpath,
+                'secure': secure.upper() == 'TRUE',
+                'httpOnly': http_only,
+                'name': name,
+                'value': value,
+            }
+            try:
+                expiry_int = int(float(expiry))
+            except ValueError:
+                continue
+            if expiry_int > 0:
+                cookie['expires'] = expiry_int
+            cookies.append(cookie)
+    return cookies
+
+
+def inject_cookies(driver, cookies):
+    """Inject cookies into the browser via CDP. Returns count of successful injections."""
+    driver.execute_cdp_cmd('Network.enable', {})
+    count = 0
+    for cookie in cookies:
+        try:
+            driver.execute_cdp_cmd('Network.setCookie', cookie)
+            count += 1
+        except Exception as e:
+            print(f"[{NODE_NAME}] [!] Cookie injection failed for '{cookie.get('name', '?')}': {e}")
+    return count
+
+
+def is_logged_out(url):
+    """Check if the browser was redirected to a Google login page."""
+    if url is None:
+        return False
+    if url.startswith('https://accounts.google.com'):
+        return True
+    if 'google.com/account/about' in url:
+        return True
+    return False
+
+
+def ensure_session(driver):
+    """Ensure the browser has a valid Google session. Retries indefinitely if cookies are expired."""
+    while True:
+        if COOKIE_FILE:
+            cookies = load_netscape_cookies(COOKIE_FILE)
+            injected = inject_cookies(driver, cookies)
+            print(f"[{NODE_NAME}] Injected {injected}/{len(cookies)} cookies from {COOKIE_FILE}")
+        driver.get(CALLING_URL)
+        time.sleep(5)
+        if not is_logged_out(driver.current_url):
+            return
+        print(f"[{NODE_NAME}] [!] Google session invalid (redirected to login). Re-export cookies to {COOKIE_FILE}; retrying in {LOGIN_RETRY_SECONDS}s.")
+        time.sleep(LOGIN_RETRY_SECONDS)
+
 
 def monitor_connection(driver):
     print(f"[{NODE_NAME}] [CITADEL.WATCHDOG] Monitoring active link...")
@@ -73,9 +152,7 @@ def main():
     driver = uc.Chrome(options=opts, version_main=None)
     
     try:
-        # Navigate to Calling Dashboard
-        print(f"[{NODE_NAME}] Navigate to: {CALLING_URL}")
-        driver.get(CALLING_URL)
+        ensure_session(driver)
         
         # Main Loop: Wait for Call -> Answer -> Monitor -> Loop
         while True:
@@ -88,12 +165,13 @@ def main():
                 for btn in buttons:
                     label = btn.get_attribute("aria-label") or ""
                     text = btn.text.lower()
-                    
+
+                    # Ignore "Join with a code" / "Entrar com um código" buttons
+                    if 'code' in text or 'código' in text:
+                        continue
+
                     # Triggers for answering
                     if "answer" in text or "atender" in text or "accept" in label.lower() or "join" in text:
-                        # Ensure it's not "Join with a code" or similar if we are just waiting
-                        # But typically on /calling/, a prompt is an incoming call or a "Join" for a scheduled one.
-                        # We'll click it.
                         print(f"[{NODE_NAME}] [RED.PHONE] !!! INCOMING CALL DETECTED !!!")
                         btn.click()
                         print(f"[{NODE_NAME}] [RED.PHONE] Call Established. Handing over to Watchdog.")
@@ -108,6 +186,8 @@ def main():
                         print(f"[{NODE_NAME}] Returning to Calling Dashboard...")
                         driver.get(CALLING_URL)
                         time.sleep(5)
+                        if is_logged_out(driver.current_url):
+                            ensure_session(driver)
                         answered = True
                         break
                 

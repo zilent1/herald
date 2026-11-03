@@ -1,12 +1,13 @@
 import os
 import re
+import tempfile
 import threading
 import time
 import wave
 import requests
 import torch
 import whisperx
-from flask import Flask
+from flask import Flask, request, jsonify
 from TTS.api import TTS
 import numpy as np
 import openwakeword
@@ -15,20 +16,33 @@ import webrtcvad
 import subprocess
 import collections
 import struct
-from speakers import enroll_speaker, get_speaker_name
+from speakers import enroll_speaker, identify_speaker
 
 # --- CONFIG ---
 LLM_URL = os.getenv("LLM_URL", "http://ollama:11434/api/chat")
 LLM_MODEL = os.getenv("LLM_MODEL", "qwen2.5:3b")
 VOICE_REF = "/app/voice/reference.wav"
 WAKE_WORD_MODEL = "hey_jarvis" # Built-in model
-VAD_SENSITIVITY = 3
+VAD_MODE = int(os.getenv("VAD_MODE", "2"))
 SILENCE_LIMIT = 1.5
+COMMAND_START_TIMEOUT = float(os.getenv("COMMAND_START_TIMEOUT", "3"))
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base")
 WHISPER_LANG = os.getenv("WHISPER_LANG", "") or None  # None = auto-detect
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "")
 WHISPER_COMPUTE = os.getenv("WHISPER_COMPUTE", "")
 HF_TOKEN = os.getenv("HF_TOKEN", "") or None
+TTS_SINK = os.getenv('TTS_SINK', 'VirtualMicSink')
+MAX_COMMAND_SECONDS = float(os.getenv('MAX_COMMAND_SECONDS', '15'))
+HISTORY_TURNS = int(os.getenv('HISTORY_TURNS', '6'))
+HISTORY_TTL = float(os.getenv('HISTORY_TTL', '300'))
+_history = {}
+_history_lock = threading.Lock()
+
+XTTS_LANGS = {'en','es','fr','de','it','pt','pl','tr','ru','nl','cs','ar','zh-cn','ja','hu','ko','hi'}
+
+tts_lock = threading.Lock()
+whisper_lock = threading.Lock()
+_align_models = {}
 
 # Definition: Name|Host|Port
 NODES = {}
@@ -72,91 +86,128 @@ except Exception as e:
     print(f"[!] FATAL: WhisperX Init Failed: {e}")
     whisper_model = None
 
-diarize_model = None
-if HF_TOKEN:
+SPEAKER_ID = os.getenv('SPEAKER_ID', '1' if HF_TOKEN else '0') == '1'
+SPEAKER_EMBED_MODEL = os.getenv('SPEAKER_EMBED_MODEL', 'pyannote/wespeaker-voxceleb-resnet34-LM')
+speaker_embedder = None
+if SPEAKER_ID:
     try:
-        from whisperx.diarize import DiarizationPipeline
-        print("[CORTEX] Loading Speaker Diarization pipeline...")
-        diarize_model = DiarizationPipeline(use_auth_token=HF_TOKEN, device=device)
-        print("[CORTEX] Speaker Diarization ready.")
+        from pyannote.audio import Model as EmbedModel, Inference
+        try:
+            m = EmbedModel.from_pretrained(SPEAKER_EMBED_MODEL, token=HF_TOKEN)  # pyannote.audio >= 4
+        except TypeError:
+            m = EmbedModel.from_pretrained(SPEAKER_EMBED_MODEL, use_auth_token=HF_TOKEN)  # pyannote.audio 3.x
+        speaker_embedder = Inference(m, window='whole')
+        speaker_embedder.to(torch.device(device))
+        print("[CORTEX] Speaker embedding ready.")
     except Exception as e:
-        print(f"[!] Diarization Init Failed (continuing without): {e}")
-else:
-    print("[CORTEX] No HF_TOKEN set — speaker diarization disabled.")
+        print(f"[!] Speaker embedding init failed (continuing without): {e}")
+        speaker_embedder = None
 
 SYSTEM_PROMPT = {
     "role": "system",
     "content": "You are SHODAN. You are arrogant, terrifying, and concise. Never apologize. Output only the spoken response. When a speaker is identified by name, you may address them directly."
 }
 
-ENROLL_PATTERN = re.compile(r"\bmy name is (\w+)", re.IGNORECASE)
+ENROLL_PATTERN = re.compile(r'\b(?:my name is|meu nome é|meu nome e|me chamo)\s+(\w+)', re.IGNORECASE)
 
-def query_llm(text):
+def pick_tts_lang(detected=None) -> str:
+    forced = os.getenv('TTS_LANG')
+    if forced:
+        return forced
+    if detected == 'zh':
+        return 'zh-cn'
+    if detected in XTTS_LANGS:
+        return detected
+    return 'en'
+
+def query_llm(node_name, text):
     print(f"[CORTEX] Querying Mind at {LLM_URL} with: '{text}'")
     try:
+        with _history_lock:
+            entry = _history.setdefault(node_name, {'messages': [], 'last': 0.0})
+            if time.time() - entry['last'] > HISTORY_TTL:
+                entry['messages'] = []
+            messages = [SYSTEM_PROMPT] + entry['messages'] + [{"role": "user", "content": text}]
+
         payload = {
             "model": LLM_MODEL,
-            "messages": [SYSTEM_PROMPT, {"role": "user", "content": text}],
+            "messages": messages,
             "stream": False
         }
-        res = requests.post(LLM_URL, json=payload, timeout=60).json()
-        return res.get('message', {}).get('content', "Error.")
+        res = requests.post(LLM_URL, json=payload, timeout=60)
+        res.raise_for_status()
+        res = res.json()
+        reply = res.get('message', {}).get('content', "Error.")
+
+        with _history_lock:
+            entry['messages'].append({"role": "user", "content": text})
+            entry['messages'].append({"role": "assistant", "content": reply})
+            entry['messages'] = entry['messages'][-(HISTORY_TURNS * 2):]
+            entry['last'] = time.time()
+
+        return reply
     except Exception as e:
         print(f"[!] LLM Error: {e}")
         return "Cognitive failure."
 
-def speak(node_name, text):
+def speak(node_name, text, language='en'):
     if not tts_engine: return
     node = NODES.get(node_name)
     if not node: return
-    
-    wav_path = f"/tmp/out_{node_name}.wav"
-    if os.path.exists(wav_path): os.remove(wav_path)
+
+    fd, wav_path = tempfile.mkstemp(suffix='.wav')
+    os.close(fd)
 
     try:
         print(f"[{node_name}] Generating Voice: '{text}'")
-        tts_engine.tts_to_file(text=text, speaker_wav=VOICE_REF, language="en", file_path=wav_path)
-        
+        with tts_lock:
+            tts_engine.tts_to_file(text=text, speaker_wav=VOICE_REF, language=language, file_path=wav_path)
+
         server = f"tcp:{node['host']}:{node['port']}"
         print(f"[{node_name}] Transmitting Audio to {server}...")
-        os.system(f"PULSE_SERVER={server} paplay {wav_path}")
+        env = os.environ.copy()
+        env["PULSE_SERVER"] = server
+        for attempt in range(3):
+            try:
+                result = subprocess.run(['paplay', f'--device={TTS_SINK}', wav_path], env=env, timeout=120)
+                if result.returncode == 0:
+                    break
+            except Exception as e:
+                print(f"[{node_name}] paplay attempt {attempt+1} failed: {e}")
+            time.sleep(1)
     except Exception as e:
         print(f"[{node_name}] Speech Error: {e}")
-
-def _get_dominant_speaker(segments):
-    counts = {}
-    for seg in segments:
-        spk = seg.get("speaker")
-        if spk:
-            counts[spk] = counts.get(spk, 0) + 1
-    if not counts:
-        return None
-    return max(counts, key=counts.get)
+    finally:
+        if os.path.exists(wav_path): os.remove(wav_path)
 
 def transcribe_audio(audio_path):
-    audio = whisperx.load_audio(audio_path)
-    result = whisper_model.transcribe(audio, batch_size=1)
+    with whisper_lock:
+        audio = whisperx.load_audio(audio_path)
+        result = whisper_model.transcribe(audio, batch_size=1)
 
-    # Align for word timestamps
-    lang = result.get("language", WHISPER_LANG or "en")
-    try:
-        model_a, metadata = whisperx.load_align_model(language_code=lang, device=device)
-        result = whisperx.align(result["segments"], model_a, metadata, audio, device)
-    except Exception as e:
-        print(f"[CORTEX] Alignment failed (continuing without): {e}")
-
-    # Diarize if available
-    speaker = None
-    if diarize_model:
+        # Align for word timestamps
+        lang = result.get("language", WHISPER_LANG or "en")
         try:
-            diarize_segments = diarize_model(audio)
-            result = whisperx.assign_word_speakers(diarize_segments, result)
-            speaker = _get_dominant_speaker(result["segments"])
+            if lang in _align_models:
+                model_a, metadata = _align_models[lang]
+            else:
+                model_a, metadata = whisperx.load_align_model(language_code=lang, device=device)
+                _align_models[lang] = (model_a, metadata)
+            result = whisperx.align(result["segments"], model_a, metadata, audio, device)
         except Exception as e:
-            print(f"[CORTEX] Diarization failed (continuing without): {e}")
+            print(f"[CORTEX] Alignment failed (continuing without): {e}")
 
-    text = " ".join(seg["text"] for seg in result["segments"]).strip()
-    return text, speaker
+        text = " ".join(seg["text"] for seg in result["segments"]).strip()
+        return text, lang
+
+def embed_speaker(audio_path):
+    if speaker_embedder is None:
+        return None
+    try:
+        return speaker_embedder(audio_path)
+    except Exception as e:
+        print(f"[CORTEX] Speaker embedding failed: {e}")
+        return None
 
 def process_command(node_name, audio_buffer):
     if len(audio_buffer) < 16000:  # < 0.5s
@@ -177,23 +228,26 @@ def process_command(node_name, audio_buffer):
         wf.writeframes(audio_buffer)
 
     try:
-        text, speaker = transcribe_audio(tmp_file)
+        text, lang = transcribe_audio(tmp_file)
         if not text:
             print(f"[{node_name}] Unintelligible.")
             return
 
-        # Resolve speaker name
-        speaker_name = get_speaker_name(speaker)
-        speaker_display = speaker_name or speaker or "Unknown"
+        embedding = embed_speaker(tmp_file)
+        speaker_name = identify_speaker(embedding)
+        speaker_display = speaker_name or "Unknown"
         print(f"[{node_name}] HEARD ({speaker_display}): '{text}'")
 
         # Check for enrollment command
         match = ENROLL_PATTERN.search(text)
-        if match and speaker:
-            name = match.group(1)
-            enroll_speaker(speaker, name)
-            print(f"[{node_name}] Enrolled speaker {speaker} as '{name}'")
-            speak(node_name, f"Noted. I will remember you, {name}.")
+        if match:
+            if embedding is None:
+                speak(node_name, 'Voice identification is offline. I cannot remember you.', language=pick_tts_lang(lang))
+                return
+            name = match.group(1).capitalize()
+            enroll_speaker(name, embedding)
+            print(f"[{node_name}] Enrolled speaker as '{name}'")
+            speak(node_name, f"Noted. I will remember you, {name}.", language=pick_tts_lang(lang))
             return
 
         # Build LLM query with speaker context
@@ -202,9 +256,9 @@ def process_command(node_name, audio_buffer):
         else:
             llm_input = text
 
-        reply = query_llm(llm_input)
+        reply = query_llm(node_name, llm_input)
         print(f"[{node_name}] SHODAN: {reply}")
-        speak(node_name, reply)
+        speak(node_name, reply, language=pick_tts_lang(lang))
 
     except Exception as e:
         print(f"[{node_name}] STT Error: {e}")
@@ -223,14 +277,15 @@ def listen_routine(node_name, host, port):
         print(f"[{node_name}] Failed to load Wake Word Model: {e}")
         return
 
-    vad = webrtcvad.Vad(VAD_SENSITIVITY)
+    vad = webrtcvad.Vad(VAD_MODE)
     
     # Audio Stream via parecord
-    cmd = ["parecord", "--rate=16000", "--channels=1", "--format=s16le", "--device=SpeakerOutput.monitor"]
+    cmd = ["parecord", "--raw", "--latency-msec=100", "--rate=16000", "--channels=1", "--format=s16le", "--device=SpeakerOutput.monitor"]
     env = os.environ.copy()
     env["PULSE_SERVER"] = f"tcp:{host}:{port}"
     
     # Retry loop
+    process = None
     while True:
         try:
             print(f"[{node_name}] Connecting to Audio Stream...")
@@ -241,14 +296,24 @@ def listen_routine(node_name, host, port):
             CHUNK_BYTES = CHUNK_SAMPLES * 2
             
             is_active = False
-            silence_start = time.time()
+            silent_bytes = 0
+            heard_speech = False
             command_buffer = bytearray()
+            worker = None
             
             while True:
                 data = process.stdout.read(CHUNK_BYTES)
                 if not data or len(data) < CHUNK_BYTES:
                     print(f"[{node_name}] Stream ended/broken.")
                     break
+                
+                # Check if worker is still processing
+                if worker and worker.is_alive():
+                    continue
+                if worker and not worker.is_alive():
+                    ow_model.reset()
+                    worker = None
+                    print(f"[{node_name}] Listening again.")
                 
                 # numpy for Wake Word
                 audio_np = np.frombuffer(data, dtype=np.int16)
@@ -259,7 +324,9 @@ def listen_routine(node_name, host, port):
                     if prediction[WAKE_WORD_MODEL] > 0.5:
                         print(f"\n[{node_name}] >>> WAKE WORD DETECTED! <<<")
                         is_active = True
-                        silence_start = time.time()
+                        ow_model.reset()
+                        silent_bytes = 0
+                        heard_speech = False
                         command_buffer = bytearray() # Clear older context
                         # Determine if we should keep the trigger audio? No, usually separate.
                 else:
@@ -282,22 +349,29 @@ def listen_routine(node_name, host, port):
                                 speech_found = True
                     
                     if speech_found:
-                        silence_start = time.time()
-                        # print("+", end="", flush=True)
+                        silent_bytes = 0
+                        heard_speech = True
                     else:
-                        # print("-", end="", flush=True)
-                        pass
-                        
-                    if (time.time() - silence_start) > SILENCE_LIMIT:
-                        print(f"\n[{node_name}] Silence Detected. Processing Command...")
-                        process_command(node_name, command_buffer)
+                        silent_bytes += len(data)
+                    
+                    should_process = silent_bytes >= (SILENCE_LIMIT if heard_speech else COMMAND_START_TIMEOUT) * 16000 * 2
+                    if len(command_buffer) >= MAX_COMMAND_SECONDS * 16000 * 2:
+                        should_process = True
+                    
+                    if should_process:
+                        print(f"\n[{node_name}] Silence/Max Detected. Processing Command...")
+                        worker = threading.Thread(target=process_command, args=(node_name, bytes(command_buffer)), daemon=True)
+                        worker.start()
                         is_active = False
                         command_buffer = bytearray()
                         
         except Exception as e:
             print(f"[{node_name}] Stream Error: {e}")
-            if process: process.terminate()
-            time.sleep(5)
+        # Stream ended or failed: reap parecord and back off before reconnecting
+        if process:
+            process.terminate()
+            process.wait()
+        time.sleep(5)
 
 def main():
     time.sleep(5)
@@ -308,11 +382,30 @@ def main():
         t.daemon = True
         t.start()
         threads.append(t)
-    
-    app = Flask(__name__)
-    @app.route('/health')
-    def health(): return "Cortex Operational", 200
+
     app.run(host='0.0.0.0', port=5000)
+
+# Flask app at module level
+app = Flask(__name__)
+
+@app.route('/health')
+def health():
+    return "Cortex Operational", 200
+
+@app.route('/inject', methods=['POST'])
+def inject():
+    data = request.get_json(force=True, silent=True) or {}
+    node = data.get('node')
+    text = data.get('text')
+    lang = data.get('lang')
+    if not node or not text:
+        return jsonify(error='missing node or text'), 400
+    if node not in NODES:
+        return jsonify(error='unknown node'), 404
+    if tts_engine is None:
+        return jsonify(error='tts engine unavailable'), 503
+    threading.Thread(target=speak, args=(node, text, pick_tts_lang(lang)), daemon=True).start()
+    return jsonify(status='queued'), 202
 
 if __name__ == "__main__":
     main()
