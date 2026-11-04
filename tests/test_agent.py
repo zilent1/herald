@@ -155,6 +155,7 @@ class TestEnsureSession:
         driver = MagicMock()
         type(driver).current_url = PropertyMock(side_effect=[
             'https://accounts.google.com/v3/signin/identifier',
+            'https://meet.google.com/calling/',
             'https://meet.google.com/calling/'
         ])
         monkeypatch.setattr(agent.time, 'sleep', lambda s: None)
@@ -366,3 +367,53 @@ class TestPageLoggedOut:
         driver = MagicMock(current_url='https://meet.google.com/abc-defg-hij')
         driver.find_elements.side_effect = Exception("boom")
         assert agent.page_logged_out(driver) is False
+
+
+class TestNovncLogin:
+    def test_passive_wait_does_not_navigate(self, monkeypatch, reset_state):
+        from unittest.mock import PropertyMock
+        driver = MagicMock()
+        driver.find_elements.return_value = []
+        login = 'https://accounts.google.com/signin'
+        meet = 'https://meet.google.com/calling/'
+        type(driver).current_url = PropertyMock(side_effect=[login, login, login, meet, meet])
+        monkeypatch.setattr(agent.time, 'sleep', lambda s: None)
+        monkeypatch.setattr(agent, 'COOKIE_INJECT', False)
+        agent.ensure_session(driver)
+        assert driver.get.call_count == 2
+        assert agent.STATE['state'] == 'idle'
+
+    def test_no_injection_by_default(self, monkeypatch, reset_state):
+        from unittest.mock import PropertyMock
+        monkeypatch.setattr(agent.time, 'sleep', lambda s: None)
+        monkeypatch.setattr(agent, 'COOKIE_INJECT', False)
+        monkeypatch.setattr(agent, 'COOKIE_FILE', '/x/auth.txt')
+        monkeypatch.setattr(agent, 'inject_cookies', MagicMock())
+        monkeypatch.setattr(agent, 'load_netscape_cookies', MagicMock(return_value=[]))
+        driver = MagicMock()
+        type(driver).current_url = PropertyMock(return_value='https://meet.google.com/calling/')
+        driver.find_elements.return_value = []
+        agent.ensure_session(driver)
+        agent.inject_cookies.assert_not_called()
+
+    def test_injection_when_enabled(self, monkeypatch, reset_state):
+        from unittest.mock import PropertyMock
+        monkeypatch.setattr(agent.time, 'sleep', lambda s: None)
+        monkeypatch.setattr(agent, 'COOKIE_INJECT', True)
+        monkeypatch.setattr(agent, 'COOKIE_FILE', '/x/auth.txt')
+        monkeypatch.setattr(agent, 'inject_cookies', MagicMock())
+        monkeypatch.setattr(agent, 'load_netscape_cookies', MagicMock(return_value=[]))
+        driver = MagicMock()
+        type(driver).current_url = PropertyMock(return_value='https://meet.google.com/calling/')
+        driver.find_elements.return_value = []
+        agent.ensure_session(driver)
+        agent.inject_cookies.assert_called_once()
+
+    def test_build_status_login_fields(self, monkeypatch, reset_state):
+        monkeypatch.setattr(agent, 'audio_sinks', lambda: list(agent.REQUIRED_SINKS))
+        monkeypatch.setattr(agent, 'COOKIE_INJECT', False)
+        monkeypatch.setattr(agent, 'NOVNC_URL', 'http://h:6801/vnc.html')
+        s = agent.build_status()
+        assert s['cookies'] is None
+        assert s['cookie_inject'] is False
+        assert s['login_url'] == 'http://h:6801/vnc.html'

@@ -18,6 +18,9 @@ REDIAL_URL = f"http://{ESP_IP}/shout" if ESP_IP else None
 CALLING_URL = os.getenv("MEET_URL", "https://meet.google.com/calling/") 
 COOKIE_FILE = os.getenv('COOKIE_FILE')
 LOGIN_RETRY_SECONDS = int(os.getenv('LOGIN_RETRY_SECONDS', '300'))
+COOKIE_INJECT = os.getenv('COOKIE_INJECT', '0') == '1'
+LOGIN_POLL_SECONDS = int(os.getenv('LOGIN_POLL_SECONDS', '10'))
+NOVNC_URL = os.getenv('NOVNC_URL', '')
 STATUS_PORT = int(os.getenv('STATUS_PORT', '8080'))
 SESSION_CHECK_SECONDS = int(os.getenv('SESSION_CHECK_SECONDS', '1800'))
 REQUIRED_SINKS = ('SpeakerOutput', 'VirtualMicSink', 'SelftestSink')
@@ -112,27 +115,45 @@ def page_logged_out(driver):
 
 
 def ensure_session(driver):
-    """Ensure the browser has a valid Google session. Retries indefinitely if cookies are expired."""
-    while True:
+    """Ensure a valid Google session. Default renewal is a manual login through noVNC; cookie-file injection is opt-in (COOKIE_INJECT=1)."""
+    def attempt():
         set_state('logging_in')
-        if COOKIE_FILE:
+        if COOKIE_INJECT and COOKIE_FILE:
             cookies = load_netscape_cookies(COOKIE_FILE)
             injected = inject_cookies(driver, cookies)
             print(f"[{NODE_NAME}] Injected {injected}/{len(cookies)} cookies from {COOKIE_FILE}")
         driver.get(CALLING_URL)
         time.sleep(5)
         if not page_logged_out(driver):
+            now = time.time()
             with _state_lock:
-                STATE['last_login_ok'] = time.time()
+                STATE['last_login_ok'] = now
                 STATE['login_failures'] = 0
-                STATE['last_session_check'] = time.time()
+                STATE['last_session_check'] = now
             set_state('idle')
-            return
+            return True
         with _state_lock:
             STATE['login_failures'] += 1
         set_state('logged_out')
-        print(f"[{NODE_NAME}] [!] Google session invalid (redirected to login). Re-export cookies to {COOKIE_FILE}; retrying in {LOGIN_RETRY_SECONDS}s.")
-        time.sleep(LOGIN_RETRY_SECONDS)
+        hint = f"Log in via noVNC {NOVNC_URL or '(noVNC disabled)'}"
+        if COOKIE_INJECT:
+            hint += f" or re-export cookies to {COOKIE_FILE}"
+        print(f"[{NODE_NAME}] [!] Google session invalid. {hint}; watching the page every {LOGIN_POLL_SECONDS}s.")
+        return False
+
+    if attempt():
+        return
+    last_attempt = time.time()
+    while True:
+        time.sleep(LOGIN_POLL_SECONDS)
+        # Don't navigate while the user is on the login form or the Meet guest page
+        retry_cookies = COOKIE_INJECT and time.time() - last_attempt >= LOGIN_RETRY_SECONDS
+        if page_logged_out(driver) and not retry_cookies:
+            continue
+        if attempt():
+            print(f"[{NODE_NAME}] Google session OK.")
+            return
+        last_attempt = time.time()
 
 
 def maybe_recheck_session(driver, now=None):
@@ -182,7 +203,9 @@ def build_status():
     missing = [s for s in REQUIRED_SINKS if s not in sinks]
     session_ok = copy['state'] in ('idle', 'in_call')
     return {'node': NODE_NAME, **copy, 'state_age_s': round(time.time() - copy['since'], 1),
-            'cookies': cookie_summary(COOKIE_FILE), 'sinks': sinks, 'missing_sinks': missing,
+            'cookies': cookie_summary(COOKIE_FILE) if COOKIE_INJECT else None,
+            'cookie_inject': COOKIE_INJECT, 'login_url': NOVNC_URL or None,
+            'sinks': sinks, 'missing_sinks': missing,
             'audio_ok': not missing, 'session_ok': session_ok, 'ok': session_ok and not missing}
 
 
