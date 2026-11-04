@@ -56,6 +56,15 @@ BASE_CORTEX = """
       - MAX_COMMAND_SECONDS=${{MAX_COMMAND_SECONDS:-15}}
       - VAD_MODE=${{VAD_MODE:-2}}
       - COMMAND_START_TIMEOUT=${{COMMAND_START_TIMEOUT:-3}}
+      - NODE_STATUS_PORT=8080
+      - SELFTEST_STIMULUS=${{SELFTEST_STIMULUS:-}}
+      - SELFTEST_RMS_MIN=${{SELFTEST_RMS_MIN:-200}}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:5000/health', timeout=3).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 600s
+      retries: 3
     depends_on:
 {depends_on}
     networks: [herald_net]
@@ -73,13 +82,22 @@ NODE_TEMPLATE = """
       - ESP_IP={esp_ip}
       - MEET_URL=${{MEET_URL_{id}:-{meet_url}}}
       # Generic paths inside container, mapped via volumes
-      - COOKIE_FILE=/app/cookies/auth.txt{novnc_env}
+      - COOKIE_FILE=/app/cookies/auth.txt
+      - STATUS_PORT=8080
+      - SESSION_CHECK_SECONDS=${{SESSION_CHECK_SECONDS:-1800}}
+      - LOGIN_RETRY_SECONDS=${{LOGIN_RETRY_SECONDS:-300}}{novnc_env}
     volumes:
       # Mount the specific cookie file for this node
       - ./cookies/{cookie_file}:/app/cookies/auth.txt
       # Persistent Chrome Profile for Red Phone Logic (Unique Volume)
       - herald_chrome_profile_{id}:/app/chrome_profile
-    expose: ["4713"]{novnc_ports}
+    expose: ["4713", "8080"]{novnc_ports}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
     dns:
       - 8.8.8.8
       - 8.8.4.4
