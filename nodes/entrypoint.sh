@@ -7,7 +7,7 @@ rm -rf /tmp/pulse-* /home/herald/.config/pulse/*.pid /tmp/.X99-lock
 rm -f /app/chrome_profile/SingletonLock /app/chrome_profile/SingletonCookie /app/chrome_profile/SingletonSocket
 
 echo "[ENTRYPOINT] Starting Xvfb..."
-Xvfb :99 -screen 0 1280x1024x24 &
+Xvfb :99 -screen 0 ${SCREEN_SIZE:-1280x1024}x24 &
 export DISPLAY=:99
 sleep 1
 

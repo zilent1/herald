@@ -315,6 +315,12 @@ def main():
     print(f"[{NODE_NAME}] Launching Chrome (version_main={chrome_ver})...")
     driver = uc.Chrome(options=opts, version_main=chrome_ver,
                        browser_executable_path=os.getenv("CHROME_BIN", "/usr/local/bin/chrome-quiet"))
+    # uc forces --window-size=1920,1080; with no window manager on Xvfb it overflows the noVNC screen
+    try:
+        w, h = (int(v) for v in os.getenv('SCREEN_SIZE', '1280x1024').split('x'))
+        driver.set_window_rect(x=0, y=0, width=w, height=h)
+    except Exception as e:
+        print(f"[{NODE_NAME}] [!] Could not fit window to screen: {e}")
     
     try:
         ensure_session(driver)
