@@ -17,3 +17,9 @@ __pycache__/
 # Local tool config
 .agent
 .claude/
+
+# Local test venv and runtime data
+.venv/
+.pytest_cache/
+whisper_cache/
+speaker_data/

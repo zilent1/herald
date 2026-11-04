@@ -24,8 +24,8 @@ H.E.R.A.L.D. hijacks Google Meet calls to bridge audio between Nest Mini speaker
 1. **Nodes** join a Google Meet call to each Nest Mini using headless Chrome
 2. **Cortex** taps into each node's audio stream via PulseAudio TCP
 3. On hearing "Hey Jarvis", it records until silence is detected (WebRTC VAD)
-4. Speech is transcribed locally via WhisperX, optionally identifying the speaker via diarization
-5. The transcript (with speaker context) is sent to the local LLM, and the response is spoken back through the Nest Mini using a voice-cloned TTS engine
+4. Speech is transcribed locally via WhisperX, optionally identifying the speaker by voice embedding
+5. The transcript (with speaker context and a short per-node conversation history) is sent to the local LLM, and the response is spoken back through the Nest Mini using a voice-cloned TTS engine, in the language that was detected
 
 ## Architecture
 
@@ -39,9 +39,13 @@ H.E.R.A.L.D. hijacks Google Meet calls to bridge audio between Nest Mini speaker
 
 Each node runs a full PulseAudio stack with virtual sinks:
 
-- `SpeakerOutput` — what Chrome plays into the Meet call (TTS output goes here)
-- `VirtualMic` — remapped source from `VirtualMicSink.monitor` (what Chrome captures)
-- `SpeakerOutput.monitor` — what Cortex records from (captures everything the Nest Mini hears)
+- `SpeakerOutput` — default sink: Chrome plays the remote side of the call (the Nest Mini's microphone) here
+- `SpeakerOutput.monitor` — what Cortex records from (everything the Nest Mini hears)
+- `VirtualMicSink` — Cortex plays TTS here (`paplay --device=VirtualMicSink`, override with `TTS_SINK`)
+- `VirtualMic` — remapped source from `VirtualMicSink.monitor`; Chrome's microphone, so TTS goes into the call
+- `SelftestSink` — silent sink where self-test replies go (see Self-Test and Monitoring)
+
+Keeping TTS off `SpeakerOutput` means Cortex never records (and wakes on) its own voice. While a command is being processed, the node's incoming audio is drained and ignored.
 
 Audio is tunneled between containers over TCP port 4713 using `module-native-protocol-tcp`.
 
@@ -49,7 +53,7 @@ Audio is tunneled between containers over TCP port 4713 using `module-native-pro
 
 - Docker and Docker Compose
 - A Google account with access to Google Meet
-- Exported Google session cookies for each node (Netscape cookie format)
+- A Google account per node (logged in once through noVNC)
 - A voice sample WAV file for TTS cloning
 - NVIDIA GPU recommended (CPU fallback available but slow for TTS)
 
@@ -73,12 +77,13 @@ herald/
 |   +-- client.conf            # PulseAudio client config
 +-- scripts/
 |   +-- generate_deployment.py # Generates docker-compose.yml from herald_nodes.json
-+-- cookies/                   # Google session cookies (per node)
+|   +-- herald_check.py        # Status/self-test CLI for cron and alerts
++-- cookies/                   # Optional Netscape cookie exports (COOKIE_INJECT=1)
 +-- voice_sample/
 |   +-- reference.wav          # Voice clone source for TTS
 +-- tts_cache/                 # Persisted Coqui XTTS v2 model files
 +-- ollama_data/               # Persisted Ollama model weights
-+-- whisper_cache/             # Persisted WhisperX / HuggingFace models
++-- whisper_cache/             # Persisted model cache (WhisperX, alignment, pyannote)
 +-- speaker_data/              # Speaker enrollment data (speakers.json)
 ```
 
@@ -92,25 +97,23 @@ Edit `herald_nodes.json` to define your nodes:
 [
     {
         "id": "01",
-        "cookie_file": "herald_node01.txt",
         "esp_ip": "192.168.1.155",
         "meet_url": "https://meet.google.com/calling/"
     }
 ]
 ```
 
-### 2. Add Session Cookies
+### 2. Log In to Google (noVNC)
 
-Export your Google account cookies in Netscape format and place them in `cookies/`:
+Each node keeps its Google session in a persistent Chrome profile volume (`herald_chrome_profile_<id>`). Log in once per node through noVNC (enabled by default): start the stack, open `http://127.0.0.1:68<id>/vnc.html`, click **Connect**, then **Sign in** on the Meet page and finish the login (2FA included). The node watches the page every `LOGIN_POLL_SECONDS` (default 10) without navigating, so it never interrupts the login; once the page leaves the login/guest screen it verifies the session and goes `idle`.
 
-```
-cookies/herald_node01.txt
-cookies/herald_node02.txt
-```
+When Google later revokes the session the node goes back to `logged_out`, `herald_check.py` prints the noVNC link (`NOVNC_URL_<id>`), and you log in the same way. No rebuild or restart is needed.
+
+**Legacy cookie injection (opt-in).** Add `"cookie_file": "herald_node01.txt"` to the node in `herald_nodes.json`, put a Netscape-format export in `cookies/`, and set `COOKIE_INJECT=1`. The node then injects the file via CDP before every login attempt and re-reads it every `LOGIN_RETRY_SECONDS` (default 300) while logged out. Leave it off when logging in through noVNC: injecting an old export overwrites the fresh session.
 
 ### 3. Set Environment Variables
 
-Create a `.env` file with the Meet room URL for each node:
+Create a `.env` file with the Meet room URL for each node (it overrides `meet_url` from `herald_nodes.json`):
 
 ```
 MEET_URL_01=https://meet.google.com/xxx-xxxx-xxx
@@ -127,6 +130,8 @@ For deployments with multiple nodes, generate `docker-compose.yml` from your con
 ```bash
 python scripts/generate_deployment.py
 ```
+
+`docker-compose.yml` is generated by this script: change the templates there, not the compose file.
 
 ### 6. Build and Run
 
@@ -190,32 +195,34 @@ WHISPER_COMPUTE=float16
 
 The non-suffixed models (`base`, `small`, etc.) are multilingual and support Portuguese, English, and 90+ other languages. The `.en` suffixed models (e.g., `base.en`) are English-only but slightly more accurate for English.
 
-WhisperX models are downloaded on first run and cached in `whisper_cache/`.
+WhisperX models (and the per-language alignment models) are downloaded on first run and cached in `whisper_cache/`.
+
+### Spoken language
+
+TTS replies in the language Whisper detected when XTTS supports it (`pt`, `en`, `es`, …), otherwise English. Set `TTS_LANG=pt` to force one.
 
 ## Speaker Identification
 
-Cortex can identify **who** is speaking using [pyannote-audio](https://github.com/pyannote/pyannote-audio) speaker diarization, integrated via WhisperX. This is optional and requires a free HuggingFace account.
+Cortex can identify **who** is speaking by comparing a voice embedding of each command (pyannote [`wespeaker-voxceleb-resnet34-LM`](https://huggingface.co/pyannote/wespeaker-voxceleb-resnet34-LM)) with the enrolled voices. Diarization labels (`SPEAKER_00`, …) are not used: they are only valid inside a single recording, so they cannot remember anyone.
 
-### Setup
-
-1. Create an account at [huggingface.co](https://huggingface.co)
-2. Accept the user agreements for [pyannote/speaker-diarization](https://huggingface.co/pyannote/speaker-diarization) and [pyannote/segmentation](https://huggingface.co/pyannote/segmentation)
-3. Generate a read-access token from your [HuggingFace settings](https://huggingface.co/settings/tokens)
-4. Add it to your `.env`:
-
-```
-HF_TOKEN=hf_your_token_here
-```
-
-If `HF_TOKEN` is not set, diarization is disabled and transcription works normally without speaker labels.
+| Variable | Default | Description |
+|---|---|---|
+| `SPEAKER_ID` | `1` if `HF_TOKEN` is set, else `0` | Enable voice identification |
+| `HF_TOKEN` | *(empty)* | HuggingFace token, used to download the embedding model |
+| `SPEAKER_EMBED_MODEL` | `pyannote/wespeaker-voxceleb-resnet34-LM` | pyannote embedding model |
+| `SPEAKER_THRESHOLD` | `0.6` | Minimum cosine similarity to accept a match |
 
 ### Speaker Enrollment
 
-When diarization is enabled, speakers are identified by anonymous labels (`SPEAKER_00`, `SPEAKER_01`, etc.). You can teach the system your name by saying:
+Say:
 
-> "Hey Jarvis, my name is John"
+> "Hey Jarvis, my name is John" (or "meu nome é João" / "me chamo João")
 
-The system will associate the diarization label with the name `John` and persist it in `speaker_data/speakers.json`. On subsequent interactions, the speaker's name is passed to the LLM so it can address them directly.
+Cortex stores the voice embedding under `John` in `speaker_data/speakers.json`. Repeating the phrase averages a new sample into the stored voice, which improves recognition. On later commands the speaker's name is passed to the LLM. Files from the old label-based format are ignored and replaced on the next enrollment.
+
+## Conversation Memory
+
+Each node keeps the last `HISTORY_TURNS` (default 6) exchanges with the LLM, forgotten after `HISTORY_TTL` seconds (default 300) of silence. A single command is capped at `MAX_COMMAND_SECONDS` (default 15). After the wake word Cortex waits up to `COMMAND_START_TIMEOUT` seconds (default 3) for speech to start, then ends the command after 1.5 s of silence. Silence is detected by WebRTC VAD in mode `VAD_MODE` (default 2; mode 3 rejects ordinary speech and cuts commands short).
 
 ## Usage
 
@@ -227,11 +234,52 @@ curl http://localhost:5000/health
 
 ### Inject Speech
 
-Send text to be spoken through a specific node:
+Send text to be spoken through a specific node (returns `202` and speaks asynchronously; optional `"lang":"pt"`):
 
 ```bash
 curl -X POST http://localhost:5000/inject -d '{"node":"Node01", "text":"I see you."}'
 ```
+
+Errors: `400` missing `node`/`text`, `404` unknown node, `503` TTS not loaded.
+
+### Self-Test and Monitoring
+
+**Status.** `GET /status` aggregates the cortex engines, each node's audio stream and each node agent's own `/status` (port 8080 on `herald_net`: `starting` / `logging_in` / `logged_out` / `idle` / `in_call`, login failures, noVNC `login_url`, PulseAudio sinks, key-cookie expiry when `COOKIE_INJECT=1`). The body's `ok` is `true` only when every node is logged in, its stream is live and all sinks exist.
+
+```bash
+curl -s http://localhost:5000/status | jq
+```
+
+A revoked session shows up as `"state": "logged_out"` with a growing `login_failures` (detected by the login redirect or, for a Meet room URL, by the guest "Your name" form). While idle, a node reloads the Meet page every `SESSION_CHECK_SECONDS` (default 1800) to notice it.
+
+**Pipeline self-test.** `POST /selftest` plays a stimulus ("Hey Jarvis." + "What is two plus two?") into the node's `SpeakerOutput`, exactly where the Nest Mini's audio arrives, and checks every stage: `stream`, `stimulus`, `wake`, `stt` (transcript contains a keyword), `llm`, `tts` (reply actually reached the sink). It does not need a call or valid cookies. The reply goes to the silent `SelftestSink`, so nothing is heard in the house during a live call; `"audible": true` uses the real `VirtualMicSink` instead. Self-test commands skip speaker identification and conversation history.
+
+```bash
+curl -s -X POST http://localhost:5000/selftest -d '{"node":"Node01"}' | jq
+```
+
+Returns `200` (pass) or `500` (fail) with per-stage `ok`, `t_ms` and `detail`; `409` if the node is busy, `404` unknown node, `503` TTS/Whisper not loaded. The stimulus is synthesized with XTTS on first use and cached in `speaker_data/selftest_stimulus.wav`. If the wake word does not fire on the synthetic voice, record your own ("Hey Jarvis … what is two plus two") and point `SELFTEST_STIMULUS` at it.
+
+| Variable | Default | Description |
+|---|---|---|
+| `SELFTEST_STIMULUS` | *(generated)* | WAV to play instead of the generated stimulus (path inside the cortex container) |
+| `SELFTEST_KEYWORDS` | `two,plus,dois,mais,four,2` | Transcript must contain one of these |
+| `SELFTEST_RMS_MIN` | `200` | Minimum reply loudness on the sink to count as sent |
+| `SESSION_CHECK_SECONDS` | `1800` | Idle session re-check interval on nodes |
+
+**CLI / cron.** `scripts/herald_check.py` (stdlib only) prints a summary and exits `0` OK, `1` pipeline failure, `2` session failure (e.g. cookies expired), `3` cortex unreachable. `--webhook URL` POSTs `{"text": …}` on failure (ntfy, Uptime Kuma push, …).
+
+```bash
+python3 scripts/herald_check.py                      # status only
+python3 scripts/herald_check.py --selftest           # + pipeline self-test on every node
+```
+
+```cron
+*/5 * * * * cd /path/to/herald && python3 scripts/herald_check.py --webhook https://ntfy.sh/herald-xyz
+0 * * * *   cd /path/to/herald && python3 scripts/herald_check.py --selftest --webhook https://ntfy.sh/herald-xyz
+```
+
+Not covered: the Nest Mini itself (speaker/mic) and the ESP redial; answering a real Meet call still needs a manual test.
 
 ### View Logs
 
@@ -288,17 +336,7 @@ Each node container runs headless Chrome on a virtual display (`Xvfb :99`). noVN
 
 ### How to enable
 
-Generate the compose file with the `--novnc` flag:
-
-```bash
-python scripts/generate_deployment.py --novnc
-```
-
-Then start as normal:
-
-```bash
-docker compose up --build
-```
+noVNC is on by default (it is how nodes log in to Google). Generate the compose file with `--no-novnc` to turn it off.
 
 ### Port scheme
 
@@ -306,19 +344,38 @@ Each node exposes its noVNC interface on a unique host port derived from its nod
 
 | Node | URL |
 |---|---|
-| `node01` | `http://<host>:6801/vnc.html` |
-| `node02` | `http://<host>:6802/vnc.html` |
+| `node01` | `http://localhost:6801/vnc.html` |
+| `node02` | `http://localhost:6802/vnc.html` |
 
 ### How it works
 
 1. `x11vnc` attaches to the Xvfb display (`:99`) and serves VNC on port `5900`
 2. `websockify` proxies VNC → WebSocket on port `6080`, serving the noVNC static files
-3. The host binds `680<id>` → container port `6080`
+3. The host binds `${NOVNC_BIND:-127.0.0.1}:68<id>` → container port `6080`
+
+### Remote access (Tailscale)
+
+Keep the port on localhost and publish it to the tailnet only, with TLS:
+
+```bash
+sudo tailscale serve --bg --https=6801 http://127.0.0.1:6801
+```
+
+Then set `NOVNC_URL_01=https://<host>.<tailnet>.ts.net:6801/vnc.html` in `.env` so `/status` and `herald_check.py` print the right link. (`tailscale serve --https=6801 off` removes it.)
 
 ### Security note
 
-noVNC has no password and no authentication. It is a development tool only. **Do not expose these ports publicly.**
+noVNC has no password and no authentication, and the browser inside is logged in to the node's Google account. Keep it on localhost, an SSH tunnel or the tailnet. **Do not expose these ports publicly** (`NOVNC_BIND=0.0.0.0` puts it on the LAN).
 
 ## Network
 
-All containers communicate over a private `herald_net` bridge network. Only the Cortex health check endpoint (port 5000) is exposed to the host. PulseAudio TCP (port 4713) is internal only.
+All containers communicate over a private `herald_net` bridge network. Only the Cortex API (port 5000) is published, bound to `127.0.0.1` by default because `/inject` has no authentication; set `CORTEX_BIND=0.0.0.0` to expose it on the LAN. All services use `restart: unless-stopped`, so a crashed node or Cortex comes back on its own. PulseAudio TCP (port 4713) is internal only.
+
+## Tests
+
+Unit tests stub the heavy ML and browser dependencies, so they run without a GPU or Docker:
+
+```bash
+uv venv .venv && uv pip install --python .venv/bin/python flask numpy requests pytest
+.venv/bin/python -m pytest -q tests/
+```

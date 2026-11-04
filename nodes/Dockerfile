@@ -1,4 +1,4 @@
-FROM python:3.10-slim-bullseye
+FROM python:3.10-slim-bookworm
 
 # Install Audio Subsystem
 RUN apt-get update && apt-get install -y pulseaudio pulseaudio-utils libasound2 alsa-utils wget gnupg unzip xvfb \
@@ -7,8 +7,8 @@ RUN apt-get update && apt-get install -y pulseaudio pulseaudio-utils libasound2 
     websockify
 
 # Install Chrome
-RUN wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | apt-key add - \
-    && echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google.list \
+RUN wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg \
+    && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google.list \
     && apt-get update && apt-get install -y google-chrome-stable
 
 WORKDIR /app
@@ -24,6 +24,7 @@ COPY daemon.conf /etc/pulse/daemon.conf
 COPY agent.py .
 # COPY default.pa /etc/pulse/default.pa # Removed to prevent recursion loop
 COPY entrypoint.sh .
+COPY chrome-quiet.sh /usr/local/bin/chrome-quiet
 
 # Allow cookies and app dir access, make entrypoint executable
 # Create persistent profile directory
@@ -31,7 +32,7 @@ USER root
 RUN mkdir -p /app/chrome_profile && \
     mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix && \
     chown -R herald:herald /app && \
-    chmod +x /app/entrypoint.sh
+    chmod +x /app/entrypoint.sh /usr/local/bin/chrome-quiet
 
 # Configure PulseAudio (Append to default.pa instead of overwriting)
 RUN echo >> /etc/pulse/default.pa && \

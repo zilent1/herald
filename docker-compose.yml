@@ -1,10 +1,10 @@
-version: '3.8'
 services:
 
   # --- THE MIND ---
   ollama:
     image: ollama/ollama
     container_name: herald_mind
+    restart: unless-stopped
     profiles: ["local-llm"]
     expose: ["11434"]
     volumes:
@@ -22,19 +22,69 @@ services:
   node01:
     build: ./nodes
     container_name: herald_node01
+    restart: unless-stopped
+    shm_size: "2gb"
     environment:
       - NODE_ID=Node01
       - ESP_IP=192.168.1.155
-      - MEET_URL=https://meet.google.com/calling/
+      - MEET_URL=${MEET_URL_01:-https://meet.google.com/calling/}
       # Generic paths inside container, mapped via volumes
       - COOKIE_FILE=/app/cookies/auth.txt
+      - STATUS_PORT=8080
+      - SESSION_CHECK_SECONDS=${SESSION_CHECK_SECONDS:-1800}
+      - LOGIN_RETRY_SECONDS=${LOGIN_RETRY_SECONDS:-300}
+      - COOKIE_INJECT=${COOKIE_INJECT:-0}
+      - LOGIN_POLL_SECONDS=${LOGIN_POLL_SECONDS:-10}
+      - NOVNC_ENABLED=1
+      - NOVNC_URL=${NOVNC_URL_01:-http://127.0.0.1:6801/vnc.html}
     volumes:
       # Mount the specific cookie file for this node
       - ./cookies/herald_node01.txt:/app/cookies/auth.txt
       # Persistent Chrome Profile for Red Phone Logic (Unique Volume)
       - herald_chrome_profile_01:/app/chrome_profile
-      - /dev/shm:/dev/shm
-    expose: ["4713"]
+    expose: ["4713", "8080"]
+    ports:
+      - "${NOVNC_BIND:-127.0.0.1}:6801:6080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+    networks: [herald_net]
+
+  # --- NODE 02 ---
+  node02:
+    build: ./nodes
+    container_name: herald_node02
+    restart: unless-stopped
+    shm_size: "2gb"
+    environment:
+      - NODE_ID=Node02
+      - ESP_IP=
+      - MEET_URL=${MEET_URL_02:-https://meet.google.com/calling/}
+      - STATUS_PORT=8080
+      - SESSION_CHECK_SECONDS=${SESSION_CHECK_SECONDS:-1800}
+      - LOGIN_RETRY_SECONDS=${LOGIN_RETRY_SECONDS:-300}
+      - COOKIE_INJECT=${COOKIE_INJECT:-0}
+      - LOGIN_POLL_SECONDS=${LOGIN_POLL_SECONDS:-10}
+      - NOVNC_ENABLED=1
+      - NOVNC_URL=${NOVNC_URL_02:-http://127.0.0.1:6802/vnc.html}
+    volumes:
+      # Persistent Chrome Profile for Red Phone Logic (Unique Volume)
+      - herald_chrome_profile_02:/app/chrome_profile
+    expose: ["4713", "8080"]
+    ports:
+      - "${NOVNC_BIND:-127.0.0.1}:6802:6080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
     dns:
       - 8.8.8.8
       - 8.8.4.4
@@ -45,20 +95,19 @@ services:
   cortex:
     build: ./cortex
     container_name: herald_cortex
+    restart: unless-stopped
     volumes:
       # Mount the Voice Sample
       - ./voice_sample/reference.wav:/app/voice/reference.wav
-      # Mount Server Cookies (Optional/Future Use)
-      - ./cookies/herald_server.txt:/app/cookies/herald_server.txt
       # Persist TTS Models
       - ./tts_cache:/root/.local/share/tts
       # Speaker enrollment data
       - ./speaker_data:/app/data
-      # WhisperX / HuggingFace model cache
-      - ./whisper_cache:/root/.cache/huggingface
-    ports: ["5000:5000"]
+      # Model cache: WhisperX, torch alignment, pyannote
+      - ./whisper_cache:/root/.cache
+    ports: ["${CORTEX_BIND:-127.0.0.1}:5000:5000"]
     environment:
-      - HERALD_NODES=Node01|node01|4713
+      - HERALD_NODES=Node01|node01|4713,Node02|node02|4713
       - LLM_URL=${LLM_URL:-http://ollama:11434/api/chat}
       - LLM_MODEL=${LLM_MODEL:-qwen2.5:3b}
       - WHISPER_MODEL=${WHISPER_MODEL:-base}
@@ -66,6 +115,26 @@ services:
       - WHISPER_DEVICE=${WHISPER_DEVICE:-}
       - WHISPER_COMPUTE=${WHISPER_COMPUTE:-}
       - HF_TOKEN=${HF_TOKEN:-}
+      - TTS_LANG=${TTS_LANG:-}
+      - SPEAKER_ID=${SPEAKER_ID:-}
+      - SPEAKER_THRESHOLD=${SPEAKER_THRESHOLD:-0.6}
+      - HISTORY_TURNS=${HISTORY_TURNS:-6}
+      - HISTORY_TTL=${HISTORY_TTL:-300}
+      - MAX_COMMAND_SECONDS=${MAX_COMMAND_SECONDS:-15}
+      - VAD_MODE=${VAD_MODE:-2}
+      - COMMAND_START_TIMEOUT=${COMMAND_START_TIMEOUT:-3}
+      - NODE_STATUS_PORT=8080
+      - SELFTEST_STIMULUS=${SELFTEST_STIMULUS:-}
+      - SELFTEST_RMS_MIN=${SELFTEST_RMS_MIN:-200}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:5000/health', timeout=3).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 600s
+      retries: 3
+    depends_on:
+      - node01
+      - node02
     networks: [herald_net]
 
 
@@ -76,4 +145,5 @@ networks:
 
 volumes:
   herald_chrome_profile_01:
+  herald_chrome_profile_02:
 

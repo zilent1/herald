@@ -3,9 +3,11 @@ set -e
 
 echo "[ENTRYPOINT] Cleaning up stale locks..."
 rm -rf /tmp/pulse-* /home/herald/.config/pulse/*.pid /tmp/.X99-lock
+# Chrome profile lives in a volume: a lock left by a previous container (other hostname) blocks startup
+rm -f /app/chrome_profile/SingletonLock /app/chrome_profile/SingletonCookie /app/chrome_profile/SingletonSocket
 
 echo "[ENTRYPOINT] Starting Xvfb..."
-Xvfb :99 -screen 0 1280x1024x24 &
+Xvfb :99 -screen 0 ${SCREEN_SIZE:-1280x1024}x24 &
 export DISPLAY=:99
 sleep 1
 
@@ -35,6 +37,7 @@ echo "[ENTRYPOINT] Configuring sinks..."
 # Doing it here ensures it's done before app starts.
 pactl load-module module-null-sink sink_name=SpeakerOutput sink_properties=device.description=SpeakerOutput || true
 pactl load-module module-null-sink sink_name=VirtualMicSink sink_properties=device.description=VirtualMicSink || true
+pactl load-module module-null-sink sink_name=SelftestSink sink_properties=device.description=SelftestSink || true
 pactl load-module module-remap-source master=VirtualMicSink.monitor source_name=VirtualMic source_properties=device.description=VirtualMic || true
 pactl set-default-sink SpeakerOutput || true
 pactl set-default-source VirtualMic || true

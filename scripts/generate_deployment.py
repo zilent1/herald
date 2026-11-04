@@ -9,6 +9,7 @@ BASE_OLLAMA = """
   ollama:
     image: ollama/ollama
     container_name: herald_mind
+    restart: unless-stopped
     profiles: ["local-llm"]
     expose: ["11434"]
     volumes:
@@ -27,18 +28,17 @@ BASE_CORTEX = """
   cortex:
     build: ./cortex
     container_name: herald_cortex
+    restart: unless-stopped
     volumes:
       # Mount the Voice Sample
       - ./voice_sample/reference.wav:/app/voice/reference.wav
-      # Mount Server Cookies (Optional/Future Use)
-      - ./cookies/herald_server.txt:/app/cookies/herald_server.txt
       # Persist TTS Models
       - ./tts_cache:/root/.local/share/tts
       # Speaker enrollment data
       - ./speaker_data:/app/data
-      # WhisperX / HuggingFace model cache
-      - ./whisper_cache:/root/.cache/huggingface
-    ports: ["5000:5000"]
+      # Model cache: WhisperX, torch alignment, pyannote
+      - ./whisper_cache:/root/.cache
+    ports: ["${{CORTEX_BIND:-127.0.0.1}}:5000:5000"]
     environment:
       - HERALD_NODES={herald_nodes_env}
       - LLM_URL=${{LLM_URL:-http://ollama:11434/api/chat}}
@@ -48,6 +48,25 @@ BASE_CORTEX = """
       - WHISPER_DEVICE=${{WHISPER_DEVICE:-}}
       - WHISPER_COMPUTE=${{WHISPER_COMPUTE:-}}
       - HF_TOKEN=${{HF_TOKEN:-}}
+      - TTS_LANG=${{TTS_LANG:-}}
+      - SPEAKER_ID=${{SPEAKER_ID:-}}
+      - SPEAKER_THRESHOLD=${{SPEAKER_THRESHOLD:-0.6}}
+      - HISTORY_TURNS=${{HISTORY_TURNS:-6}}
+      - HISTORY_TTL=${{HISTORY_TTL:-300}}
+      - MAX_COMMAND_SECONDS=${{MAX_COMMAND_SECONDS:-15}}
+      - VAD_MODE=${{VAD_MODE:-2}}
+      - COMMAND_START_TIMEOUT=${{COMMAND_START_TIMEOUT:-3}}
+      - NODE_STATUS_PORT=8080
+      - SELFTEST_STIMULUS=${{SELFTEST_STIMULUS:-}}
+      - SELFTEST_RMS_MIN=${{SELFTEST_RMS_MIN:-200}}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:5000/health', timeout=3).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 600s
+      retries: 3
+    depends_on:
+{depends_on}
     networks: [herald_net]
 """
 
@@ -56,19 +75,27 @@ NODE_TEMPLATE = """
   node{id}:
     build: ./nodes
     container_name: herald_node{id}
+    restart: unless-stopped
+    shm_size: "2gb"
     environment:
       - NODE_ID=Node{id}
       - ESP_IP={esp_ip}
-      - MEET_URL={meet_url}
-      # Generic paths inside container, mapped via volumes
-      - COOKIE_FILE=/app/cookies/auth.txt{novnc_env}
+      - MEET_URL=${{MEET_URL_{id}:-{meet_url}}}
+{cookie_env}      - STATUS_PORT=8080
+      - SESSION_CHECK_SECONDS=${{SESSION_CHECK_SECONDS:-1800}}
+      - LOGIN_RETRY_SECONDS=${{LOGIN_RETRY_SECONDS:-300}}
+      - COOKIE_INJECT=${{COOKIE_INJECT:-0}}
+      - LOGIN_POLL_SECONDS=${{LOGIN_POLL_SECONDS:-10}}{novnc_env}
     volumes:
-      # Mount the specific cookie file for this node
-      - ./cookies/{cookie_file}:/app/cookies/auth.txt
-      # Persistent Chrome Profile for Red Phone Logic (Unique Volume)
+{cookie_volume}      # Persistent Chrome Profile for Red Phone Logic (Unique Volume)
       - herald_chrome_profile_{id}:/app/chrome_profile
-      - /dev/shm:/dev/shm
-    expose: ["4713"]{novnc_ports}
+    expose: ["4713", "8080"]{novnc_ports}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
     dns:
       - 8.8.8.8
       - 8.8.4.4
@@ -86,22 +113,32 @@ def generate(novnc=False):
     services_yaml = ""
     volumes_yaml = "\nvolumes:\n"
     cortex_nodes_env = []
+    node_ids = []
 
     # Generate Node Services
     for node in nodes_config:
         nid = node['id']
+        node_ids.append(nid)
         # 1. Add Service Block
         if novnc:
-            novnc_env = "\n      - NOVNC_ENABLED=1"
-            novnc_ports = f"\n    ports:\n      - \"68{nid}:6080\""
+            novnc_env = f"\n      - NOVNC_ENABLED=1\n      - NOVNC_URL=${{NOVNC_URL_{nid}:-http://127.0.0.1:68{nid}/vnc.html}}"
+            novnc_ports = f"\n    ports:\n      - \"${{NOVNC_BIND:-127.0.0.1}}:68{nid}:6080\""
         else:
             novnc_env = ""
             novnc_ports = ""
+        cookie_file = node.get('cookie_file')
+        if cookie_file:
+            cookie_env = f"      # Generic paths inside container, mapped via volumes\n      - COOKIE_FILE=/app/cookies/auth.txt\n"
+            cookie_volume = f"      # Mount the specific cookie file for this node\n      - ./cookies/{cookie_file}:/app/cookies/auth.txt\n"
+        else:
+            cookie_env = ""
+            cookie_volume = ""
         services_yaml += NODE_TEMPLATE.format(
             id=nid,
-            esp_ip=node['esp_ip'],
+            esp_ip=node.get('esp_ip', ''),
             meet_url=node.get('meet_url', 'https://meet.google.com/calling/'),
-            cookie_file=node['cookie_file'],
+            cookie_env=cookie_env,
+            cookie_volume=cookie_volume,
             novnc_env=novnc_env,
             novnc_ports=novnc_ports
         )
@@ -114,18 +151,11 @@ def generate(novnc=False):
         cortex_nodes_env.append(f"Node{nid}|node{nid}|4713")
 
     # Generate Cortex Block
-    cortex_block = BASE_CORTEX.format(herald_nodes_env=",".join(cortex_nodes_env))
-    
-    # Add Dependencies to Cortex
-    # We need to inject depend_on for all nodes to ensure they start before Cortex attempts to connect?
-    # Actually, Cortex logic handles connection failures, so depends_on isn't strictly necessary for logic, 
-    # but good for startup order.
-    # Let's modify BASE_CORTEX slightly or just append them. 
-    # For simplicity, we keep simple depends_on [ollama] for now.
+    cortex_depends_on = "\n".join(f"      - node{nid}" for nid in node_ids)
+    cortex_block = BASE_CORTEX.format(herald_nodes_env=",".join(cortex_nodes_env), depends_on=cortex_depends_on)
 
     # Combine All
-    final_compose = f"""version: '3.8'
-services:
+    final_compose = f"""services:
 {BASE_OLLAMA}
 {services_yaml}
 {cortex_block}
@@ -145,6 +175,7 @@ networks:
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--novnc", action="store_true", help="Enable noVNC on port 680<id> per node")
+    parser.add_argument("--novnc", action="store_true", help="deprecated, noVNC is on by default")
+    parser.add_argument("--no-novnc", action="store_true", help="Disable noVNC")
     args = parser.parse_args()
-    generate(novnc=args.novnc)
+    generate(novnc=not args.no_novnc)
