@@ -313,7 +313,8 @@ def main():
 
     chrome_ver = chrome_major_version()
     print(f"[{NODE_NAME}] Launching Chrome (version_main={chrome_ver})...")
-    driver = uc.Chrome(options=opts, version_main=chrome_ver)
+    driver = uc.Chrome(options=opts, version_main=chrome_ver,
+                       browser_executable_path=os.getenv("CHROME_BIN", "/usr/local/bin/chrome-quiet"))
     
     try:
         ensure_session(driver)

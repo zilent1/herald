@@ -24,6 +24,7 @@ COPY daemon.conf /etc/pulse/daemon.conf
 COPY agent.py .
 # COPY default.pa /etc/pulse/default.pa # Removed to prevent recursion loop
 COPY entrypoint.sh .
+COPY chrome-quiet.sh /usr/local/bin/chrome-quiet
 
 # Allow cookies and app dir access, make entrypoint executable
 # Create persistent profile directory
@@ -31,7 +32,7 @@ USER root
 RUN mkdir -p /app/chrome_profile && \
     mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix && \
     chown -R herald:herald /app && \
-    chmod +x /app/entrypoint.sh
+    chmod +x /app/entrypoint.sh /usr/local/bin/chrome-quiet
 
 # Configure PulseAudio (Append to default.pa instead of overwriting)
 RUN echo >> /etc/pulse/default.pa && \
