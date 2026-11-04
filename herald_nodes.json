@@ -4,5 +4,10 @@
         "cookie_file": "herald_node01.txt",
         "esp_ip": "192.168.1.155",
         "meet_url": "https://meet.google.com/calling/"
+    },
+    {
+        "id": "02",
+        "esp_ip": "",
+        "meet_url": "https://meet.google.com/calling/"
     }
 ]

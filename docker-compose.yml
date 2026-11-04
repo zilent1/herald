@@ -56,6 +56,40 @@ services:
       - 8.8.4.4
     networks: [herald_net]
 
+  # --- NODE 02 ---
+  node02:
+    build: ./nodes
+    container_name: herald_node02
+    restart: unless-stopped
+    shm_size: "2gb"
+    environment:
+      - NODE_ID=Node02
+      - ESP_IP=
+      - MEET_URL=${MEET_URL_02:-https://meet.google.com/calling/}
+      - STATUS_PORT=8080
+      - SESSION_CHECK_SECONDS=${SESSION_CHECK_SECONDS:-1800}
+      - LOGIN_RETRY_SECONDS=${LOGIN_RETRY_SECONDS:-300}
+      - COOKIE_INJECT=${COOKIE_INJECT:-0}
+      - LOGIN_POLL_SECONDS=${LOGIN_POLL_SECONDS:-10}
+      - NOVNC_ENABLED=1
+      - NOVNC_URL=${NOVNC_URL_02:-http://127.0.0.1:6802/vnc.html}
+    volumes:
+      # Persistent Chrome Profile for Red Phone Logic (Unique Volume)
+      - herald_chrome_profile_02:/app/chrome_profile
+    expose: ["4713", "8080"]
+    ports:
+      - "${NOVNC_BIND:-127.0.0.1}:6802:6080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+    networks: [herald_net]
+
 
   # --- THE CORTEX ---
   cortex:
@@ -73,7 +107,7 @@ services:
       - ./whisper_cache:/root/.cache
     ports: ["${CORTEX_BIND:-127.0.0.1}:5000:5000"]
     environment:
-      - HERALD_NODES=Node01|node01|4713
+      - HERALD_NODES=Node01|node01|4713,Node02|node02|4713
       - LLM_URL=${LLM_URL:-http://ollama:11434/api/chat}
       - LLM_MODEL=${LLM_MODEL:-qwen2.5:3b}
       - WHISPER_MODEL=${WHISPER_MODEL:-base}
@@ -100,6 +134,7 @@ services:
       retries: 3
     depends_on:
       - node01
+      - node02
     networks: [herald_net]
 
 
@@ -110,4 +145,5 @@ networks:
 
 volumes:
   herald_chrome_profile_01:
+  herald_chrome_profile_02:
 
