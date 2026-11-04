@@ -22,6 +22,7 @@ STATUS_PORT = int(os.getenv('STATUS_PORT', '8080'))
 SESSION_CHECK_SECONDS = int(os.getenv('SESSION_CHECK_SECONDS', '1800'))
 REQUIRED_SINKS = ('SpeakerOutput', 'VirtualMicSink', 'SelftestSink')
 KEY_COOKIES = ('SID', '__Secure-1PSID', '__Secure-3PSID')
+GUEST_SELECTOR = 'input[aria-label="Your name"], input[aria-label="Seu nome"]'
 
 # --- STATE MACHINE ---
 STATE = {'state': 'starting', 'since': time.time(), 'login_failures': 0,
@@ -100,6 +101,16 @@ def is_logged_out(url):
     return False
 
 
+def page_logged_out(driver):
+    """Check if the current page indicates a logged-out state (login redirect or Meet guest page)."""
+    if is_logged_out(driver.current_url):
+        return True
+    try:
+        return len(driver.find_elements(By.CSS_SELECTOR, GUEST_SELECTOR)) > 0
+    except Exception:
+        return False
+
+
 def ensure_session(driver):
     """Ensure the browser has a valid Google session. Retries indefinitely if cookies are expired."""
     while True:
@@ -110,7 +121,7 @@ def ensure_session(driver):
             print(f"[{NODE_NAME}] Injected {injected}/{len(cookies)} cookies from {COOKIE_FILE}")
         driver.get(CALLING_URL)
         time.sleep(5)
-        if not is_logged_out(driver.current_url):
+        if not page_logged_out(driver):
             with _state_lock:
                 STATE['last_login_ok'] = time.time()
                 STATE['login_failures'] = 0
@@ -134,7 +145,7 @@ def maybe_recheck_session(driver, now=None):
     STATE['last_session_check'] = now
     driver.refresh()
     time.sleep(5)
-    if is_logged_out(driver.current_url):
+    if page_logged_out(driver):
         print(f"[{NODE_NAME}] [!] Session lost while idle.")
         set_state('logged_out')
         ensure_session(driver)
@@ -323,7 +334,7 @@ def main():
                         print(f"[{NODE_NAME}] Returning to Calling Dashboard...")
                         driver.get(CALLING_URL)
                         time.sleep(5)
-                        if is_logged_out(driver.current_url):
+                        if page_logged_out(driver):
                             ensure_session(driver)
                         answered = True
                         break

@@ -345,3 +345,24 @@ class TestChromeMajorVersion:
             raise FileNotFoundError
         monkeypatch.setattr(agent.subprocess, 'run', _raise)
         assert agent.chrome_major_version() is None
+
+
+class TestPageLoggedOut:
+    def test_login_url(self):
+        driver = MagicMock(current_url='https://accounts.google.com/v3/signin/identifier')
+        assert agent.page_logged_out(driver) is True
+
+    def test_meet_guest_page(self):
+        driver = MagicMock(current_url='https://meet.google.com/abc-defg-hij')
+        driver.find_elements.return_value = [object()]
+        assert agent.page_logged_out(driver) is True
+
+    def test_meet_no_guest(self):
+        driver = MagicMock(current_url='https://meet.google.com/abc-defg-hij')
+        driver.find_elements.return_value = []
+        assert agent.page_logged_out(driver) is False
+
+    def test_find_elements_raises(self):
+        driver = MagicMock(current_url='https://meet.google.com/abc-defg-hij')
+        driver.find_elements.side_effect = Exception("boom")
+        assert agent.page_logged_out(driver) is False
