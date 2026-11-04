@@ -417,3 +417,166 @@ class TestNovncLogin:
         assert s['cookies'] is None
         assert s['cookie_inject'] is False
         assert s['login_url'] == 'http://h:6801/vnc.html'
+
+
+class TestIsAnswerButton:
+    def test_atender(self):
+        assert agent.is_answer_button('Atender', '') is True
+
+    def test_join_with_code_english(self):
+        assert agent.is_answer_button('Join with a code', '') is False
+
+    def test_join_with_code_portuguese(self):
+        assert agent.is_answer_button('Participar com código', '') is False
+
+    def test_accept_aria_label(self):
+        assert agent.is_answer_button('', 'Accept call') is True
+
+    def test_recusar(self):
+        assert agent.is_answer_button('Recusar', '') is False
+
+
+class TestFindAnswerButton:
+    def test_button_in_top_doc(self):
+        btn = MagicMock()
+        btn.text = 'Atender'
+        btn.get_attribute.return_value = None
+
+        driver = MagicMock()
+        driver.find_elements.return_value = [btn]
+
+        result = agent.find_answer_button(driver)
+        assert result is btn
+        driver.switch_to.frame.assert_not_called()
+
+    def test_button_in_about_blank_iframe(self):
+        btn = MagicMock()
+        btn.text = 'Atender'
+        btn.get_attribute.return_value = None
+
+        iframe = MagicMock()
+        iframe.get_attribute.return_value = 'about:blank'
+
+        state = {'in_iframe': False}
+
+        def fake_find_elements(by, tag):
+            if tag == "button":
+                if not state['in_iframe']:
+                    return []
+                return [btn]
+            return [iframe]
+
+        def fake_frame(frame_arg):
+            state['in_iframe'] = True
+
+        driver = MagicMock()
+        driver.find_elements.side_effect = fake_find_elements
+        driver.switch_to.frame.side_effect = fake_frame
+
+        result = agent.find_answer_button(driver)
+        assert result is btn
+        driver.switch_to.frame.assert_called_once_with(iframe)
+
+    def test_cross_origin_iframe_skipped(self):
+        iframe = MagicMock()
+        iframe.get_attribute.return_value = 'https://accounts.google.com/login'
+
+        driver = MagicMock()
+
+        def fake_find_elements(by, tag):
+            if tag == "button":
+                return []
+            return [iframe]
+
+        driver.find_elements.side_effect = fake_find_elements
+
+        result = agent.find_answer_button(driver)
+        assert result is None
+        driver.switch_to.frame.assert_not_called()
+
+    def test_nothing_found_returns_none(self):
+        iframe = MagicMock()
+        iframe.get_attribute.return_value = ''
+
+        state = {'in_iframe': False}
+
+        def fake_find_elements(by, tag):
+            if tag == "button":
+                return []
+            return [iframe]
+
+        def fake_frame(frame_arg):
+            state['in_iframe'] = True
+
+        driver = MagicMock()
+        driver.find_elements.side_effect = fake_find_elements
+        driver.switch_to.frame.side_effect = fake_frame
+
+        result = agent.find_answer_button(driver)
+        assert result is None
+        driver.switch_to.default_content.assert_called()
+
+
+class TestCallActive:
+    def test_button_in_top_doc(self):
+        """Hang-up button in top-level content: True, no frame switch."""
+        driver = MagicMock()
+        driver.find_elements.return_value = [object()]
+        assert agent.call_active(driver) is True
+        driver.switch_to.frame.assert_not_called()
+
+    def test_button_in_about_blank_iframe(self):
+        """Hang-up button only inside an about:blank iframe: True, frame entered and left."""
+        iframe = MagicMock()
+        iframe.get_attribute.return_value = 'about:blank'
+        state = {'in_iframe': False}
+
+        def fake_find_elements(by, selector):
+            if selector == 'iframe':
+                return [iframe]
+            if state['in_iframe']:
+                return [object()]
+            return []
+
+        def fake_frame(frame_arg):
+            state['in_iframe'] = True
+
+        driver = MagicMock()
+        driver.find_elements.side_effect = fake_find_elements
+        driver.switch_to.frame.side_effect = fake_frame
+
+        assert agent.call_active(driver) is True
+        driver.switch_to.frame.assert_called_once_with(iframe)
+        driver.switch_to.default_content.assert_called_once()
+
+    def test_cross_origin_iframe_skipped(self):
+        """Cross-origin iframe is skipped: False, no frame switch."""
+        iframe = MagicMock()
+        iframe.get_attribute.return_value = 'https://accounts.google.com/login'
+
+        def fake_find_elements(by, selector):
+            if selector == 'iframe':
+                return [iframe]
+            return []
+
+        driver = MagicMock()
+        driver.find_elements.side_effect = fake_find_elements
+
+        assert agent.call_active(driver) is False
+        driver.switch_to.frame.assert_not_called()
+
+    def test_nothing_found_returns_false(self):
+        """No hang-up button anywhere: False, default_content called after iframe scan."""
+        iframe = MagicMock()
+        iframe.get_attribute.return_value = ''
+
+        def fake_find_elements(by, selector):
+            if selector == 'iframe':
+                return [iframe]
+            return []
+
+        driver = MagicMock()
+        driver.find_elements.side_effect = fake_find_elements
+
+        assert agent.call_active(driver) is False
+        driver.switch_to.default_content.assert_called_once()

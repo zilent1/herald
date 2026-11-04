@@ -247,14 +247,8 @@ def monitor_connection(driver):
     # This loop runs while IN a call
     while True:
         try:
-            # Check if we are still on the active call page
-            # Usually, Meet calls have an 'aria-label' for 'End call' or 'Leave call' (Sair / Leave call)
-            # Adjust selectors based on language if necessary, but 'End call' or icon based is standard
-            # We look for the "End call" button which signifies an active call.
-            hangup_btns = driver.find_elements(By.XPATH, "//button[contains(@aria-label, 'Leave') or contains(@aria-label, 'Sair') or contains(@aria-label, 'End')]")
-            
             # If no hangup button is found, the call has likely ended/dropped
-            if len(hangup_btns) == 0:
+            if not call_active(driver):
                 print(f"[{NODE_NAME}] [!] CALL DROPPED. Re-establishing connection...")
                 try:
                     if REDIAL_URL:
@@ -285,6 +279,77 @@ def chrome_major_version():
     except Exception:
         pass
     return None
+
+
+def is_answer_button(text, label):
+    """Return True if the button text/label matches an incoming-call answer trigger."""
+    text = text.lower()
+    label = label.lower()
+    if 'code' in text or 'código' in text:
+        return False
+    if 'answer' in text or 'atender' in text or 'accept' in label or 'join' in text:
+        return True
+    return False
+
+
+def _scannable_iframes(driver):
+    """Return iframes safe to scan: empty src, about:, or meet.google.com."""
+    iframes = []
+    for iframe in driver.find_elements(By.TAG_NAME, "iframe"):
+        try:
+            src = iframe.get_attribute('src') or ''
+        except Exception:
+            continue
+        if src == '' or src.startswith('about:') or src.startswith('https://meet.google.com'):
+            iframes.append(iframe)
+    return iframes
+
+
+def find_answer_button(driver):
+    """Scan the default content and same-origin iframes for an answer button.
+    Returns the WebElement if found (driver may be left inside the iframe), else None."""
+    buttons = driver.find_elements(By.TAG_NAME, "button")
+    for btn in buttons:
+        try:
+            if is_answer_button(btn.text, btn.get_attribute('aria-label') or ''):
+                return btn
+        except Exception:
+            continue
+
+    for iframe in _scannable_iframes(driver):
+        try:
+            driver.switch_to.frame(iframe)
+            for btn in driver.find_elements(By.TAG_NAME, "button"):
+                try:
+                    if is_answer_button(btn.text, btn.get_attribute('aria-label') or ''):
+                        return btn
+                except Exception:
+                    continue
+            driver.switch_to.default_content()
+        except Exception:
+            driver.switch_to.default_content()
+    return None
+
+
+HANGUP_XPATH = "//button[contains(@aria-label, 'Leave') or contains(@aria-label, 'Sair') or contains(@aria-label, 'End')]"
+
+
+def call_active(driver):
+    """Return True if the hang-up button is visible in default content or a scannable iframe.
+    The driver always ends in default content."""
+    if driver.find_elements(By.XPATH, HANGUP_XPATH):
+        return True
+    for iframe in _scannable_iframes(driver):
+        try:
+            try:
+                driver.switch_to.frame(iframe)
+                if driver.find_elements(By.XPATH, HANGUP_XPATH):
+                    return True
+            finally:
+                driver.switch_to.default_content()
+        except Exception:
+            pass
+    return False
 
 
 def main():
@@ -330,53 +395,48 @@ def main():
             try:
                 # Look for "Answer" or "Accept" or "Atender" buttons
                 # Incoming call usually pops up a "Receive call" modal or bar.
-                buttons = driver.find_elements(By.TAG_NAME, "button")
+                btn = find_answer_button(driver)
                 answered = False
-                
-                for btn in buttons:
-                    label = btn.get_attribute("aria-label") or ""
-                    text = btn.text.lower()
 
-                    # Ignore "Join with a code" / "Entrar com um código" buttons
-                    if 'code' in text or 'código' in text:
-                        continue
+                if btn:
+                    print(f"[{NODE_NAME}] [RED.PHONE] !!! INCOMING CALL DETECTED !!!")
+                    btn.click()
+                    driver.switch_to.default_content()
+                    set_state('in_call')
+                    with _state_lock:
+                        STATE['calls_answered'] += 1
+                        STATE['last_call_start'] = time.time()
+                    print(f"[{NODE_NAME}] [RED.PHONE] Call Established. Handing over to Watchdog.")
 
-                    # Triggers for answering
-                    if "answer" in text or "atender" in text or "accept" in label.lower() or "join" in text:
-                        print(f"[{NODE_NAME}] [RED.PHONE] !!! INCOMING CALL DETECTED !!!")
-                        btn.click()
-                        set_state('in_call')
-                        with _state_lock:
-                            STATE['calls_answered'] += 1
-                            STATE['last_call_start'] = time.time()
-                        print(f"[{NODE_NAME}] [RED.PHONE] Call Established. Handing over to Watchdog.")
-                        
-                        # Wait a bit for call to fully load
-                        time.sleep(5)
-                        
-                        # Monitor the call
-                        monitor_connection(driver)
+                    # Wait a bit for call to fully load
+                    time.sleep(5)
 
-                        # Exited watchdog means call ended. Return to dashboard.
-                        with _state_lock:
-                            STATE['last_call_end'] = time.time()
-                        set_state('idle')
-                        print(f"[{NODE_NAME}] Returning to Calling Dashboard...")
-                        driver.get(CALLING_URL)
-                        time.sleep(5)
-                        if page_logged_out(driver):
-                            ensure_session(driver)
-                        answered = True
-                        break
-                
+                    # Monitor the call
+                    monitor_connection(driver)
+
+                    # Exited watchdog means call ended. Return to dashboard.
+                    with _state_lock:
+                        STATE['last_call_end'] = time.time()
+                    set_state('idle')
+                    print(f"[{NODE_NAME}] Returning to Calling Dashboard...")
+                    driver.get(CALLING_URL)
+                    time.sleep(5)
+                    if page_logged_out(driver):
+                        ensure_session(driver)
+                    answered = True
+
                 if not answered:
                     maybe_recheck_session(driver)
                     # Optional: Refresh occasionally to keep session alive?
                     # Or just wait. Google Meet updates dynamically.
                     time.sleep(2)
-            
+
             except Exception as e:
                 print(f"[{NODE_NAME}] [!] Scan Error: {e}")
+                try:
+                    driver.switch_to.default_content()
+                except Exception:
+                    pass
                 time.sleep(5)
                 
     except Exception as e:
