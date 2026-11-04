@@ -703,6 +703,7 @@ def collect_status():
 
 # Flask app at module level
 app = Flask(__name__)
+app.json.sort_keys = False  # keep selftest stages in pipeline order
 
 @app.route('/health')
 def health():
