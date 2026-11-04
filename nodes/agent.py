@@ -1,7 +1,11 @@
+import json
 import os
+import subprocess
+import threading
 import time
 import requests
 import undetected_chromedriver as uc
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
 
@@ -13,6 +17,22 @@ REDIAL_URL = f"http://{ESP_IP}/shout" if ESP_IP else None
 CALLING_URL = os.getenv("MEET_URL", "https://meet.google.com/calling/") 
 COOKIE_FILE = os.getenv('COOKIE_FILE')
 LOGIN_RETRY_SECONDS = int(os.getenv('LOGIN_RETRY_SECONDS', '300'))
+STATUS_PORT = int(os.getenv('STATUS_PORT', '8080'))
+SESSION_CHECK_SECONDS = int(os.getenv('SESSION_CHECK_SECONDS', '1800'))
+REQUIRED_SINKS = ('SpeakerOutput', 'VirtualMicSink', 'SelftestSink')
+KEY_COOKIES = ('SID', '__Secure-1PSID', '__Secure-3PSID')
+
+# --- STATE MACHINE ---
+STATE = {'state': 'starting', 'since': time.time(), 'login_failures': 0,
+         'last_login_ok': None, 'calls_answered': 0, 'last_call_start': None,
+         'last_call_end': None, 'last_session_check': None}
+_state_lock = threading.Lock()
+
+def set_state(name):
+    with _state_lock:
+        if STATE['state'] != name:
+            STATE['state'] = name
+            STATE['since'] = time.time()
 
 # --- AUDIO SETUP ---
 # Handled by entrypoint.sh
@@ -82,6 +102,7 @@ def is_logged_out(url):
 def ensure_session(driver):
     """Ensure the browser has a valid Google session. Retries indefinitely if cookies are expired."""
     while True:
+        set_state('logging_in')
         if COOKIE_FILE:
             cookies = load_netscape_cookies(COOKIE_FILE)
             injected = inject_cookies(driver, cookies)
@@ -89,9 +110,101 @@ def ensure_session(driver):
         driver.get(CALLING_URL)
         time.sleep(5)
         if not is_logged_out(driver.current_url):
+            with _state_lock:
+                STATE['last_login_ok'] = time.time()
+                STATE['login_failures'] = 0
+                STATE['last_session_check'] = time.time()
+            set_state('idle')
             return
+        with _state_lock:
+            STATE['login_failures'] += 1
+        set_state('logged_out')
         print(f"[{NODE_NAME}] [!] Google session invalid (redirected to login). Re-export cookies to {COOKIE_FILE}; retrying in {LOGIN_RETRY_SECONDS}s.")
         time.sleep(LOGIN_RETRY_SECONDS)
+
+
+def maybe_recheck_session(driver, now=None):
+    now = now or time.time()
+    if STATE['state'] != 'idle':
+        return False
+    last = STATE['last_session_check']
+    if last is not None and now - last < SESSION_CHECK_SECONDS:
+        return False
+    STATE['last_session_check'] = now
+    driver.refresh()
+    time.sleep(5)
+    if is_logged_out(driver.current_url):
+        print(f"[{NODE_NAME}] [!] Session lost while idle.")
+        set_state('logged_out')
+        ensure_session(driver)
+        return True
+    return False
+
+
+def cookie_summary(path):
+    if not path or not os.path.isfile(path):
+        return {'file': path, 'exists': False, 'age_days': None, 'days_to_expiry': None, 'key_cookies': []}
+    mtime = os.path.getmtime(path)
+    age_days = round((time.time() - mtime) / 86400, 1)
+    cookies = load_netscape_cookies(path)
+    expiries = [c['expires'] for c in cookies if c.get('name') in KEY_COOKIES and 'expires' in c]
+    days_to_expiry = min(round((e - time.time()) / 86400, 1) for e in expiries) if expiries else None
+    present = sorted(c['name'] for c in cookies if c.get('name') in KEY_COOKIES)
+    return {'file': path, 'exists': True, 'age_days': age_days, 'days_to_expiry': days_to_expiry, 'key_cookies': present}
+
+
+def audio_sinks():
+    try:
+        r = subprocess.run(['pactl', 'list', 'short', 'sinks'], capture_output=True, text=True, timeout=5)
+        if r.returncode != 0:
+            return []
+        return [line.split('\t')[1] for line in r.stdout.splitlines() if line.strip() and len(line.split('\t')) >= 2]
+    except Exception:
+        return []
+
+
+def build_status():
+    with _state_lock:
+        copy = dict(STATE)
+    sinks = audio_sinks()
+    missing = [s for s in REQUIRED_SINKS if s not in sinks]
+    session_ok = copy['state'] in ('idle', 'in_call')
+    return {'node': NODE_NAME, **copy, 'state_age_s': round(time.time() - copy['since'], 1),
+            'cookies': cookie_summary(COOKIE_FILE), 'sinks': sinks, 'missing_sinks': missing,
+            'audio_ok': not missing, 'session_ok': session_ok, 'ok': session_ok and not missing}
+
+
+class StatusHandler(BaseHTTPRequestHandler):
+    def _send(self, code, obj):
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path == '/status':
+            self._send(200, build_status())
+        elif self.path == '/health':
+            s = build_status()
+            self._send(200 if s['audio_ok'] else 503, {'ok': s['audio_ok']})
+        else:
+            self._send(404, {'error': 'not found'})
+
+    def log_message(self, *args):
+        pass
+
+
+def start_status_server(port=None):
+    try:
+        server = ThreadingHTTPServer(('0.0.0.0', STATUS_PORT if port is None else port), StatusHandler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        print(f"[{NODE_NAME}] Status server on http://0.0.0.0:{STATUS_PORT}/status")
+        return server
+    except OSError as e:
+        print(f"[{NODE_NAME}] [!] Status server failed to start: {e}")
+        return None
 
 
 def monitor_connection(driver):
@@ -126,6 +239,7 @@ def monitor_connection(driver):
             time.sleep(5)
 
 def main():
+    start_status_server()
     print(f"[{NODE_NAME}] [RED.PHONE] Receiver Online. Loading Profile from {PROFILE_PATH}...")
     
     opts = uc.ChromeOptions()
@@ -174,6 +288,10 @@ def main():
                     if "answer" in text or "atender" in text or "accept" in label.lower() or "join" in text:
                         print(f"[{NODE_NAME}] [RED.PHONE] !!! INCOMING CALL DETECTED !!!")
                         btn.click()
+                        set_state('in_call')
+                        with _state_lock:
+                            STATE['calls_answered'] += 1
+                            STATE['last_call_start'] = time.time()
                         print(f"[{NODE_NAME}] [RED.PHONE] Call Established. Handing over to Watchdog.")
                         
                         # Wait a bit for call to fully load
@@ -181,8 +299,11 @@ def main():
                         
                         # Monitor the call
                         monitor_connection(driver)
-                        
+
                         # Exited watchdog means call ended. Return to dashboard.
+                        with _state_lock:
+                            STATE['last_call_end'] = time.time()
+                        set_state('idle')
                         print(f"[{NODE_NAME}] Returning to Calling Dashboard...")
                         driver.get(CALLING_URL)
                         time.sleep(5)
@@ -192,6 +313,7 @@ def main():
                         break
                 
                 if not answered:
+                    maybe_recheck_session(driver)
                     # Optional: Refresh occasionally to keep session alive?
                     # Or just wait. Google Meet updates dynamically.
                     time.sleep(2)

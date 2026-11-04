@@ -161,3 +161,168 @@ class TestEnsureSession:
         monkeypatch.setattr(agent, 'COOKIE_FILE', None)
         agent.ensure_session(driver)
         assert driver.get.call_count == 2
+
+
+import time
+import pytest
+
+@pytest.fixture
+def reset_state():
+    saved = dict(agent.STATE)
+    yield
+    agent.STATE.clear()
+    agent.STATE.update(saved)
+
+
+class TestSetState:
+    def test_set_state_since(self, reset_state):
+        agent.STATE['state'] = 'pre_x1'
+        agent.set_state('x1')
+        since1 = agent.STATE['since']
+        time.sleep(0.01)
+        agent.set_state('x1')
+        assert agent.STATE['since'] == since1
+
+
+class TestEnsureSessionTransitions:
+    def test_ensure_session_transitions(self, monkeypatch, reset_state):
+        class FakeDriver:
+            def __init__(self):
+                self.urls = ['https://accounts.google.com/signin', 'https://meet.google.com/calling/']
+            def get(self, url):
+                pass
+            @property
+            def current_url(self):
+                url = self.urls[0]
+                if len(self.urls) > 1:
+                    self.urls.pop(0)
+                return url
+
+        monkeypatch.setattr(agent.time, 'sleep', lambda s: None)
+        monkeypatch.setattr(agent, 'COOKIE_FILE', None)
+
+        recorded = []
+        original_set_state = agent.set_state
+        def recorder(name):
+            recorded.append(name)
+            original_set_state(name)
+        monkeypatch.setattr(agent, 'set_state', recorder)
+
+        agent.ensure_session(FakeDriver())
+        assert agent.STATE['state'] == 'idle'
+        assert agent.STATE['login_failures'] == 0
+        assert agent.STATE['last_login_ok'] is not None
+        assert recorded == ['logging_in', 'logged_out', 'logging_in', 'idle']
+
+
+class TestMaybeRecheckSession:
+    def test_recheck_skips_when_not_idle(self, reset_state):
+        agent.STATE['state'] = 'logged_out'
+        driver = MagicMock()
+        result = agent.maybe_recheck_session(driver)
+        assert result is False
+        driver.refresh.assert_not_called()
+
+    def test_recheck_skips_when_recent(self, monkeypatch, reset_state):
+        agent.STATE['state'] = 'idle'
+        agent.STATE['last_session_check'] = time.time() - 10
+        driver = MagicMock()
+        result = agent.maybe_recheck_session(driver)
+        assert result is False
+        driver.refresh.assert_not_called()
+
+    def test_recheck_detects_logout(self, monkeypatch, reset_state):
+        agent.STATE['state'] = 'idle'
+        agent.STATE['last_session_check'] = None
+        driver = MagicMock(current_url='https://accounts.google.com/x')
+        monkeypatch.setattr(agent.time, 'sleep', lambda s: None)
+        monkeypatch.setattr(agent, 'ensure_session', MagicMock())
+        result = agent.maybe_recheck_session(driver)
+        assert result is True
+        driver.refresh.assert_called_once()
+        agent.ensure_session.assert_called_with(driver)
+        assert agent.STATE['state'] == 'logged_out'
+
+    def test_recheck_ok(self, monkeypatch, reset_state):
+        agent.STATE['state'] = 'idle'
+        agent.STATE['last_session_check'] = None
+        driver = MagicMock(current_url='https://meet.google.com/calling/')
+        monkeypatch.setattr(agent.time, 'sleep', lambda s: None)
+        result = agent.maybe_recheck_session(driver)
+        assert result is False
+        assert agent.STATE['last_session_check'] is not None
+
+
+import types
+import json
+import urllib.request
+import urllib.error
+
+
+class TestCookieSummary:
+    def test_cookie_summary_key_cookie(self, tmp_path):
+        content = ('.google.com\tTRUE\t/\tTRUE\t' + str(int(time.time() + 10 * 86400)) + '\tSID\tX\n'
+                   '.google.com\tTRUE\t/\tTRUE\t' + str(int(time.time() + 99 * 86400)) + '\tNID\tY\n')
+        path = _write_cookie_file(tmp_path, content)
+        result = agent.cookie_summary(path)
+        assert result['exists'] is True
+        assert 9.9 <= result['days_to_expiry'] <= 10.1
+        assert result['key_cookies'] == ['SID']
+        assert result['age_days'] >= 0
+
+    def test_cookie_summary_none(self):
+        result = agent.cookie_summary(None)
+        assert result['exists'] is False
+        assert result['key_cookies'] == []
+
+
+class TestAudioSinks:
+    def test_audio_sinks_parse(self, monkeypatch):
+        monkeypatch.setattr(agent.subprocess, 'run',
+            lambda *a, **kw: types.SimpleNamespace(returncode=0, stdout='0\tSpeakerOutput\tmodule-null-sink.c\ts16le 2ch 44100Hz\tIDLE\n1\tVirtualMicSink\tmodule-null-sink.c\ts16le 2ch 44100Hz\tIDLE\n'))
+        assert agent.audio_sinks() == ['SpeakerOutput', 'VirtualMicSink']
+        monkeypatch.setattr(agent.subprocess, 'run',
+            lambda *a, **kw: types.SimpleNamespace(returncode=1, stdout=''))
+        assert agent.audio_sinks() == []
+
+        def _raise(*a, **kw):
+            raise FileNotFoundError
+        monkeypatch.setattr(agent.subprocess, 'run', _raise)
+        assert agent.audio_sinks() == []
+
+
+class TestBuildStatus:
+    def test_build_status(self, monkeypatch, reset_state):
+        monkeypatch.setattr(agent, 'audio_sinks', lambda: ['SpeakerOutput', 'VirtualMicSink'])
+        agent.STATE['state'] = 'idle'
+        s = agent.build_status()
+        assert s['missing_sinks'] == ['SelftestSink']
+        assert s['audio_ok'] is False
+        assert s['session_ok'] is True
+        assert s['ok'] is False
+        monkeypatch.setattr(agent, 'audio_sinks', lambda: ['SpeakerOutput', 'VirtualMicSink', 'SelftestSink'])
+        s = agent.build_status()
+        assert s['ok'] is True
+        agent.STATE['state'] = 'logged_out'
+        s = agent.build_status()
+        assert s['ok'] is False
+
+
+class TestStatusHttp:
+    def test_status_http(self, monkeypatch):
+        monkeypatch.setattr(agent, 'build_status', lambda: {'node': 'NodeT', 'audio_ok': False})
+        server = agent.start_status_server(port=0)
+        port = server.server_address[1]
+        try:
+            resp = urllib.request.urlopen('http://127.0.0.1:%d/status' % port)
+            assert resp.status == 200
+            assert json.loads(resp.read())['node'] == 'NodeT'
+            with pytest.raises(urllib.error.HTTPError) as exc_info:
+                urllib.request.urlopen('http://127.0.0.1:%d/health' % port)
+            assert exc_info.value.code == 503
+            with pytest.raises(urllib.error.HTTPError) as exc_info2:
+                urllib.request.urlopen('http://127.0.0.1:%d/nope' % port)
+            assert exc_info2.value.code == 404
+        finally:
+            server.shutdown()
+            server.server_close()
