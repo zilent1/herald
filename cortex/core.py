@@ -52,6 +52,7 @@ SELFTEST_COMMAND_TEXT = os.getenv('SELFTEST_COMMAND_TEXT', 'What is two plus two
 SELFTEST_KEYWORDS = [w.strip().lower() for w in os.getenv('SELFTEST_KEYWORDS', 'two,plus,dois,mais,four,2').split(',') if w.strip()]
 SELFTEST_RMS_MIN = float(os.getenv('SELFTEST_RMS_MIN', '200'))
 STREAM_STALE_SECONDS = float(os.getenv('STREAM_STALE_SECONDS', '10'))
+NODE_STATUS_PORT = int(os.getenv('NODE_STATUS_PORT', '8080'))
 
 def node_state(node_name):
     with _state_lock:
@@ -660,12 +661,56 @@ def run_selftest(node_name, audible=False, timeout=120.0):
     return result
 
 
+def fetch_node_status(node_name):
+    host = NODES[node_name]['host']
+    try:
+        r = requests.get(f'http://{host}:{NODE_STATUS_PORT}/status', timeout=3)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        return {'ok': False, 'error': str(e), 'unreachable': True}
+
+def collect_status():
+    now = time.time()
+    nodes = {}
+    for name in NODES:
+        st = dict(node_state(name))
+        age = round(now - st['last_audio_ts'], 1) if st['last_audio_ts'] else None
+        stream_ok = st['stream_connected'] and age is not None and age <= STREAM_STALE_SECONDS
+        agent = fetch_node_status(name)
+        nodes[name] = {
+            'stream_connected': st['stream_connected'],
+            'stream_age_s': age,
+            'stream_ok': stream_ok,
+            'busy': st['busy'],
+            'last_wake_ts': st['last_wake_ts'] or None,
+            'last_command_ts': st['last_command_ts'] or None,
+            'last_selftest': st['last_selftest'],
+            'agent': agent,
+            'ok': bool(stream_ok and agent.get('ok')),
+        }
+    engines = {
+        'tts': tts_engine is not None,
+        'whisper': whisper_model is not None,
+        'speaker_id': speaker_embedder is not None,
+    }
+    nodes_ok = all(n['ok'] for n in nodes.values()) if nodes else False
+    return {
+        'ok': bool(nodes_ok and engines['tts'] and engines['whisper']),
+        'engines': engines,
+        'nodes': nodes,
+    }
+
 # Flask app at module level
 app = Flask(__name__)
 
 @app.route('/health')
 def health():
     return "Cortex Operational", 200
+
+@app.route('/status')
+def status():
+    return jsonify(collect_status()), 200
 
 @app.route('/inject', methods=['POST'])
 def inject():

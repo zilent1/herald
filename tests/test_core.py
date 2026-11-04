@@ -657,3 +657,77 @@ def test_run_selftest_full(monkeypatch):
     assert 'Node01' not in core._selftest_pending
     # _listeners for that node is empty
     assert core._listeners.get('Node01', []) == []
+
+
+# ---------------------------------------------------------------------------
+# GET /status
+# ---------------------------------------------------------------------------
+
+def test_status_ok(monkeypatch):
+    """GET /status with healthy node -> ok True, stream_ok True."""
+    monkeypatch.setattr(core, 'NODES', {'Node01': {'host': 'node01', 'port': '4713'}})
+    monkeypatch.setattr(core, 'tts_engine', MagicMock())
+    monkeypatch.setattr(core, 'whisper_model', MagicMock())
+    monkeypatch.setattr(core, 'speaker_embedder', MagicMock())
+    monkeypatch.setattr(core, 'fetch_node_status', lambda name: {'ok': True, 'state': 'idle'})
+    st = core.node_state('Node01')
+    st['stream_connected'] = True
+    st['last_audio_ts'] = time.time()
+    try:
+        app = core.app.test_client()
+        resp = app.get('/status')
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data['ok'] is True
+        assert data['nodes']['Node01']['stream_ok'] is True
+        assert data['nodes']['Node01']['ok'] is True
+    finally:
+        core.NODE_STATE.pop('Node01', None)
+
+def test_status_agent_down(monkeypatch):
+    """GET /status with agent logged_out -> ok False, node ok False."""
+    monkeypatch.setattr(core, 'NODES', {'Node01': {'host': 'node01', 'port': '4713'}})
+    monkeypatch.setattr(core, 'tts_engine', MagicMock())
+    monkeypatch.setattr(core, 'whisper_model', MagicMock())
+    monkeypatch.setattr(core, 'speaker_embedder', MagicMock())
+    monkeypatch.setattr(core, 'fetch_node_status', lambda name: {'ok': False, 'state': 'logged_out'})
+    st = core.node_state('Node01')
+    st['stream_connected'] = True
+    st['last_audio_ts'] = time.time()
+    try:
+        app = core.app.test_client()
+        resp = app.get('/status')
+        data = resp.get_json()
+        assert data['ok'] is False
+        assert data['nodes']['Node01']['ok'] is False
+    finally:
+        core.NODE_STATE.pop('Node01', None)
+
+def test_status_stream_stale(monkeypatch):
+    """GET /status with last_audio_ts 60s ago -> stream_ok False."""
+    monkeypatch.setattr(core, 'NODES', {'Node01': {'host': 'node01', 'port': '4713'}})
+    monkeypatch.setattr(core, 'tts_engine', MagicMock())
+    monkeypatch.setattr(core, 'whisper_model', MagicMock())
+    monkeypatch.setattr(core, 'speaker_embedder', MagicMock())
+    monkeypatch.setattr(core, 'fetch_node_status', lambda name: {'ok': True, 'state': 'idle'})
+    st = core.node_state('Node01')
+    st['stream_connected'] = True
+    st['last_audio_ts'] = time.time() - 60
+    try:
+        app = core.app.test_client()
+        resp = app.get('/status')
+        data = resp.get_json()
+        assert data['nodes']['Node01']['stream_ok'] is False
+    finally:
+        core.NODE_STATE.pop('Node01', None)
+
+def test_fetch_node_status_unreachable(monkeypatch):
+    """fetch_node_status with requests.get raising -> returns unreachable True."""
+    monkeypatch.setattr(core, 'NODES', {'Node01': {'host': 'node01', 'port': '4713'}})
+
+    def fake_get(*a, **kw):
+        raise Exception('boom')
+    monkeypatch.setattr(core.requests, 'get', fake_get)
+    result = core.fetch_node_status('Node01')
+    assert result['unreachable'] is True
+    assert result['ok'] is False
