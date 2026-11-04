@@ -81,15 +81,13 @@ NODE_TEMPLATE = """
       - NODE_ID=Node{id}
       - ESP_IP={esp_ip}
       - MEET_URL=${{MEET_URL_{id}:-{meet_url}}}
-      # Generic paths inside container, mapped via volumes
-      - COOKIE_FILE=/app/cookies/auth.txt
-      - STATUS_PORT=8080
+{cookie_env}      - STATUS_PORT=8080
       - SESSION_CHECK_SECONDS=${{SESSION_CHECK_SECONDS:-1800}}
-      - LOGIN_RETRY_SECONDS=${{LOGIN_RETRY_SECONDS:-300}}{novnc_env}
+      - LOGIN_RETRY_SECONDS=${{LOGIN_RETRY_SECONDS:-300}}
+      - COOKIE_INJECT=${{COOKIE_INJECT:-0}}
+      - LOGIN_POLL_SECONDS=${{LOGIN_POLL_SECONDS:-10}}{novnc_env}
     volumes:
-      # Mount the specific cookie file for this node
-      - ./cookies/{cookie_file}:/app/cookies/auth.txt
-      # Persistent Chrome Profile for Red Phone Logic (Unique Volume)
+{cookie_volume}      # Persistent Chrome Profile for Red Phone Logic (Unique Volume)
       - herald_chrome_profile_{id}:/app/chrome_profile
     expose: ["4713", "8080"]{novnc_ports}
     healthcheck:
@@ -123,16 +121,24 @@ def generate(novnc=False):
         node_ids.append(nid)
         # 1. Add Service Block
         if novnc:
-            novnc_env = "\n      - NOVNC_ENABLED=1"
-            novnc_ports = f"\n    ports:\n      - \"127.0.0.1:68{nid}:6080\""
+            novnc_env = f"\n      - NOVNC_ENABLED=1\n      - NOVNC_URL=${{NOVNC_URL_{nid}:-http://127.0.0.1:68{nid}/vnc.html}}"
+            novnc_ports = f"\n    ports:\n      - \"${{NOVNC_BIND:-127.0.0.1}}:68{nid}:6080\""
         else:
             novnc_env = ""
             novnc_ports = ""
+        cookie_file = node.get('cookie_file')
+        if cookie_file:
+            cookie_env = f"      # Generic paths inside container, mapped via volumes\n      - COOKIE_FILE=/app/cookies/auth.txt\n"
+            cookie_volume = f"      # Mount the specific cookie file for this node\n      - ./cookies/{cookie_file}:/app/cookies/auth.txt\n"
+        else:
+            cookie_env = ""
+            cookie_volume = ""
         services_yaml += NODE_TEMPLATE.format(
             id=nid,
             esp_ip=node.get('esp_ip', ''),
             meet_url=node.get('meet_url', 'https://meet.google.com/calling/'),
-            cookie_file=node['cookie_file'],
+            cookie_env=cookie_env,
+            cookie_volume=cookie_volume,
             novnc_env=novnc_env,
             novnc_ports=novnc_ports
         )
@@ -169,6 +175,7 @@ networks:
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--novnc", action="store_true", help="Enable noVNC on port 680<id> per node")
+    parser.add_argument("--novnc", action="store_true", help="deprecated, noVNC is on by default")
+    parser.add_argument("--no-novnc", action="store_true", help="Disable noVNC")
     args = parser.parse_args()
-    generate(novnc=args.novnc)
+    generate(novnc=not args.no_novnc)

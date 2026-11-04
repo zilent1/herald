@@ -83,7 +83,7 @@ def check_status(base_url, http=None):
         state_str = state or 'UNREACHABLE'
         login_failures = agent.get('login_failures', 0)
         cookies = (agent.get('cookies') or {}).get('days_to_expiry')
-        cookies_str = f"{cookies}d" if cookies is not None else '?'
+        cookies_str = f"{cookies}d" if cookies is not None else ('off' if agent.get('cookie_inject') is False else '?')
         missing = agent.get('missing_sinks', [])
         sinks_str = 'ok' if not missing else 'missing:' + ','.join(missing)
 
@@ -91,6 +91,8 @@ def check_status(base_url, http=None):
             f"{name}  stream={stream_str}  agent={state_str}  "
             f"login_failures={login_failures}  cookies={cookies_str}  sinks={sinks_str}"
         )
+        if state == 'logged_out' and agent.get('login_url'):
+            lines.append(f"  log in via noVNC: {agent['login_url']}")
 
         # Determine worst code for this node
         if state not in ('idle', 'in_call'):

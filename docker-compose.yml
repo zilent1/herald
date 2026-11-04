@@ -33,12 +33,18 @@ services:
       - STATUS_PORT=8080
       - SESSION_CHECK_SECONDS=${SESSION_CHECK_SECONDS:-1800}
       - LOGIN_RETRY_SECONDS=${LOGIN_RETRY_SECONDS:-300}
+      - COOKIE_INJECT=${COOKIE_INJECT:-0}
+      - LOGIN_POLL_SECONDS=${LOGIN_POLL_SECONDS:-10}
+      - NOVNC_ENABLED=1
+      - NOVNC_URL=${NOVNC_URL_01:-http://127.0.0.1:6801/vnc.html}
     volumes:
       # Mount the specific cookie file for this node
       - ./cookies/herald_node01.txt:/app/cookies/auth.txt
       # Persistent Chrome Profile for Red Phone Logic (Unique Volume)
       - herald_chrome_profile_01:/app/chrome_profile
     expose: ["4713", "8080"]
+    ports:
+      - "${NOVNC_BIND:-127.0.0.1}:6801:6080"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3).status == 200 else 1)"]
       interval: 30s

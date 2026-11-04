@@ -53,7 +53,7 @@ Audio is tunneled between containers over TCP port 4713 using `module-native-pro
 
 - Docker and Docker Compose
 - A Google account with access to Google Meet
-- Exported Google session cookies for each node (Netscape cookie format)
+- A Google account per node (logged in once through noVNC)
 - A voice sample WAV file for TTS cloning
 - NVIDIA GPU recommended (CPU fallback available but slow for TTS)
 
@@ -78,7 +78,7 @@ herald/
 +-- scripts/
 |   +-- generate_deployment.py # Generates docker-compose.yml from herald_nodes.json
 |   +-- herald_check.py        # Status/self-test CLI for cron and alerts
-+-- cookies/                   # Google session cookies (per node)
++-- cookies/                   # Optional Netscape cookie exports (COOKIE_INJECT=1)
 +-- voice_sample/
 |   +-- reference.wav          # Voice clone source for TTS
 +-- tts_cache/                 # Persisted Coqui XTTS v2 model files
@@ -97,21 +97,19 @@ Edit `herald_nodes.json` to define your nodes:
 [
     {
         "id": "01",
-        "cookie_file": "herald_node01.txt",
         "esp_ip": "192.168.1.155",
         "meet_url": "https://meet.google.com/calling/"
     }
 ]
 ```
 
-### 2. Add Session Cookies
+### 2. Log In to Google (noVNC)
 
-Export your Google account cookies in Netscape format and place them in `cookies/`:
+Each node keeps its Google session in a persistent Chrome profile volume (`herald_chrome_profile_<id>`). Log in once per node through noVNC (enabled by default): start the stack, open `http://127.0.0.1:68<id>/vnc.html`, click **Connect**, then **Sign in** on the Meet page and finish the login (2FA included). The node watches the page every `LOGIN_POLL_SECONDS` (default 10) without navigating, so it never interrupts the login; once the page leaves the login/guest screen it verifies the session and goes `idle`.
 
-```
-cookies/herald_node01.txt
-cookies/herald_node02.txt
-```
+When Google later revokes the session the node goes back to `logged_out`, `herald_check.py` prints the noVNC link (`NOVNC_URL_<id>`), and you log in the same way. No rebuild or restart is needed.
+
+**Legacy cookie injection (opt-in).** Add `"cookie_file": "herald_node01.txt"` to the node in `herald_nodes.json`, put a Netscape-format export in `cookies/`, and set `COOKIE_INJECT=1`. The node then injects the file via CDP before every login attempt and re-reads it every `LOGIN_RETRY_SECONDS` (default 300) while logged out. Leave it off when logging in through noVNC: injecting an old export overwrites the fresh session.
 
 ### 3. Set Environment Variables
 
@@ -120,10 +118,6 @@ Create a `.env` file with the Meet room URL for each node (it overrides `meet_ur
 ```
 MEET_URL_01=https://meet.google.com/xxx-xxxx-xxx
 ```
-
-On startup each node loads its cookie file into Chrome (via CDP) before opening Meet, so a fresh profile volume logs in without manual steps.
-
-Google invalidates exported session cookies after a while. When that happens the node logs `Google session invalid (redirected to login)` and retries every `LOGIN_RETRY_SECONDS` (default 300), re-reading the cookie file each time: export fresh cookies over `cookies/herald_nodeXX.txt` and the node picks them up without a rebuild.
 
 ### 4. Add a Voice Sample
 
@@ -250,13 +244,13 @@ Errors: `400` missing `node`/`text`, `404` unknown node, `503` TTS not loaded.
 
 ### Self-Test and Monitoring
 
-**Status.** `GET /status` aggregates the cortex engines, each node's audio stream and each node agent's own `/status` (port 8080 on `herald_net`: `starting` / `logging_in` / `logged_out` / `idle` / `in_call`, login failures, key-cookie expiry, PulseAudio sinks). The body's `ok` is `true` only when every node is logged in, its stream is live and all sinks exist.
+**Status.** `GET /status` aggregates the cortex engines, each node's audio stream and each node agent's own `/status` (port 8080 on `herald_net`: `starting` / `logging_in` / `logged_out` / `idle` / `in_call`, login failures, noVNC `login_url`, PulseAudio sinks, key-cookie expiry when `COOKIE_INJECT=1`). The body's `ok` is `true` only when every node is logged in, its stream is live and all sinks exist.
 
 ```bash
 curl -s http://localhost:5000/status | jq
 ```
 
-Expired cookies show up as `"state": "logged_out"` with a growing `login_failures`. While idle, a node reloads the Meet page every `SESSION_CHECK_SECONDS` (default 1800) to notice a session Google revoked server-side; `days_to_expiry` only reflects the cookie file and cannot see that.
+A revoked session shows up as `"state": "logged_out"` with a growing `login_failures` (detected by the login redirect or, for a Meet room URL, by the guest "Your name" form). While idle, a node reloads the Meet page every `SESSION_CHECK_SECONDS` (default 1800) to notice it.
 
 **Pipeline self-test.** `POST /selftest` plays a stimulus ("Hey Jarvis." + "What is two plus two?") into the node's `SpeakerOutput`, exactly where the Nest Mini's audio arrives, and checks every stage: `stream`, `stimulus`, `wake`, `stt` (transcript contains a keyword), `llm`, `tts` (reply actually reached the sink). It does not need a call or valid cookies. The reply goes to the silent `SelftestSink`, so nothing is heard in the house during a live call; `"audible": true` uses the real `VirtualMicSink` instead. Self-test commands skip speaker identification and conversation history.
 
@@ -342,17 +336,7 @@ Each node container runs headless Chrome on a virtual display (`Xvfb :99`). noVN
 
 ### How to enable
 
-Generate the compose file with the `--novnc` flag:
-
-```bash
-python scripts/generate_deployment.py --novnc
-```
-
-Then start as normal:
-
-```bash
-docker compose up --build
-```
+noVNC is on by default (it is how nodes log in to Google). Generate the compose file with `--no-novnc` to turn it off.
 
 ### Port scheme
 
@@ -367,11 +351,21 @@ Each node exposes its noVNC interface on a unique host port derived from its nod
 
 1. `x11vnc` attaches to the Xvfb display (`:99`) and serves VNC on port `5900`
 2. `websockify` proxies VNC → WebSocket on port `6080`, serving the noVNC static files
-3. The host binds `127.0.0.1:680<id>` → container port `6080` (use an SSH tunnel to reach it remotely)
+3. The host binds `${NOVNC_BIND:-127.0.0.1}:68<id>` → container port `6080`
+
+### Remote access (Tailscale)
+
+Keep the port on localhost and publish it to the tailnet only, with TLS:
+
+```bash
+sudo tailscale serve --bg --https=6801 http://127.0.0.1:6801
+```
+
+Then set `NOVNC_URL_01=https://<host>.<tailnet>.ts.net:6801/vnc.html` in `.env` so `/status` and `herald_check.py` print the right link. (`tailscale serve --https=6801 off` removes it.)
 
 ### Security note
 
-noVNC has no password and no authentication. It is a development tool only. **Do not expose these ports publicly.**
+noVNC has no password and no authentication, and the browser inside is logged in to the node's Google account. Keep it on localhost, an SSH tunnel or the tailnet. **Do not expose these ports publicly** (`NOVNC_BIND=0.0.0.0` puts it on the LAN).
 
 ## Network
 
