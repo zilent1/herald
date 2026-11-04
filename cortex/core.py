@@ -333,6 +333,8 @@ def process_command(node_name, audio_buffer):
 
     except Exception as e:
         print(f"[{node_name}] STT Error: {e}")
+    finally:
+        node_state(node_name)['busy'] = False  # don't wait for the next audio burst in listen_routine
 
 def listen_routine(node_name, host, port):
     st = node_state(node_name)
