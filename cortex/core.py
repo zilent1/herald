@@ -16,6 +16,7 @@ import webrtcvad
 import subprocess
 import collections
 import struct
+import queue
 from speakers import enroll_speaker, identify_speaker
 
 # --- CONFIG ---
@@ -37,6 +38,49 @@ HISTORY_TURNS = int(os.getenv('HISTORY_TURNS', '6'))
 HISTORY_TTL = float(os.getenv('HISTORY_TTL', '300'))
 _history = {}
 _history_lock = threading.Lock()
+
+# --- Node state & event bus ---
+NODE_STATE = {}
+_state_lock = threading.Lock()
+_listeners = {}  # node -> list of queue.Queue
+_selftest_pending = {}  # node -> run dict
+SELFTEST_SINK = os.getenv('SELFTEST_SINK', 'SelftestSink')
+
+def node_state(node_name):
+    with _state_lock:
+        if node_name not in NODE_STATE:
+            NODE_STATE[node_name] = {
+                'stream_connected': False,
+                'last_audio_ts': 0.0,
+                'busy': False,
+                'last_wake_ts': 0.0,
+                'last_command_ts': 0.0,
+                'last_selftest': None,
+            }
+        return NODE_STATE[node_name]
+
+def emit(node_name, stage, **data):
+    event = {'stage': stage, 'ts': time.time(), **data}
+    if stage == 'wake':
+        node_state(node_name)['last_wake_ts'] = event['ts']
+    if stage == 'transcribed':
+        node_state(node_name)['last_command_ts'] = event['ts']
+    with _state_lock:
+        subs = list(_listeners.get(node_name, []))
+    for q in subs:
+        q.put_nowait(event)
+
+def subscribe(node_name):
+    q = queue.Queue()
+    with _state_lock:
+        _listeners.setdefault(node_name, []).append(q)
+    return q
+
+def unsubscribe(node_name, q):
+    with _state_lock:
+        subs = _listeners.get(node_name, [])
+        if q in subs:
+            subs.remove(q)
 
 XTTS_LANGS = {'en','es','fr','de','it','pt','pl','tr','ru','nl','cs','ar','zh-cn','ja','hu','ko','hi'}
 
@@ -120,14 +164,17 @@ def pick_tts_lang(detected=None) -> str:
         return detected
     return 'en'
 
-def query_llm(node_name, text):
+def query_llm(node_name, text, use_history=True):
     print(f"[CORTEX] Querying Mind at {LLM_URL} with: '{text}'")
     try:
-        with _history_lock:
-            entry = _history.setdefault(node_name, {'messages': [], 'last': 0.0})
-            if time.time() - entry['last'] > HISTORY_TTL:
-                entry['messages'] = []
-            messages = [SYSTEM_PROMPT] + entry['messages'] + [{"role": "user", "content": text}]
+        if use_history:
+            with _history_lock:
+                entry = _history.setdefault(node_name, {'messages': [], 'last': 0.0})
+                if time.time() - entry['last'] > HISTORY_TTL:
+                    entry['messages'] = []
+                messages = [SYSTEM_PROMPT] + entry['messages'] + [{"role": "user", "content": text}]
+        else:
+            messages = [SYSTEM_PROMPT, {"role": "user", "content": text}]
 
         payload = {
             "model": LLM_MODEL,
@@ -139,25 +186,28 @@ def query_llm(node_name, text):
         res = res.json()
         reply = res.get('message', {}).get('content', "Error.")
 
-        with _history_lock:
-            entry['messages'].append({"role": "user", "content": text})
-            entry['messages'].append({"role": "assistant", "content": reply})
-            entry['messages'] = entry['messages'][-(HISTORY_TURNS * 2):]
-            entry['last'] = time.time()
+        if use_history:
+            with _history_lock:
+                entry['messages'].append({"role": "user", "content": text})
+                entry['messages'].append({"role": "assistant", "content": reply})
+                entry['messages'] = entry['messages'][-(HISTORY_TURNS * 2):]
+                entry['last'] = time.time()
 
         return reply
     except Exception as e:
         print(f"[!] LLM Error: {e}")
         return "Cognitive failure."
 
-def speak(node_name, text, language='en'):
-    if not tts_engine: return
+def speak(node_name, text, language='en', sink=None):
+    if not tts_engine: return False
     node = NODES.get(node_name)
-    if not node: return
+    if not node: return False
 
+    device = sink or TTS_SINK
     fd, wav_path = tempfile.mkstemp(suffix='.wav')
     os.close(fd)
 
+    ok = False
     try:
         print(f"[{node_name}] Generating Voice: '{text}'")
         with tts_lock:
@@ -169,8 +219,9 @@ def speak(node_name, text, language='en'):
         env["PULSE_SERVER"] = server
         for attempt in range(3):
             try:
-                result = subprocess.run(['paplay', f'--device={TTS_SINK}', wav_path], env=env, timeout=120)
+                result = subprocess.run(['paplay', f'--device={device}', wav_path], env=env, timeout=120)
                 if result.returncode == 0:
+                    ok = True
                     break
             except Exception as e:
                 print(f"[{node_name}] paplay attempt {attempt+1} failed: {e}")
@@ -179,6 +230,9 @@ def speak(node_name, text, language='en'):
         print(f"[{node_name}] Speech Error: {e}")
     finally:
         if os.path.exists(wav_path): os.remove(wav_path)
+
+    emit(node_name, 'tts_sent', ok=ok, sink=device)
+    return ok
 
 def transcribe_audio(audio_path):
     with whisper_lock:
@@ -228,9 +282,17 @@ def process_command(node_name, audio_buffer):
         wf.writeframes(audio_buffer)
 
     try:
+        run = _selftest_pending.get(node_name)
         text, lang = transcribe_audio(tmp_file)
+        emit(node_name, 'transcribed', text=text, lang=lang)
         if not text:
             print(f"[{node_name}] Unintelligible.")
+            return
+
+        if run is not None:
+            reply = query_llm(node_name, text, use_history=False)
+            emit(node_name, 'llm', reply=reply)
+            speak(node_name, reply, language=pick_tts_lang(lang), sink=None if run.get('audible') else SELFTEST_SINK)
             return
 
         embedding = embed_speaker(tmp_file)
@@ -257,6 +319,7 @@ def process_command(node_name, audio_buffer):
             llm_input = text
 
         reply = query_llm(node_name, llm_input)
+        emit(node_name, 'llm', reply=reply)
         print(f"[{node_name}] SHODAN: {reply}")
         speak(node_name, reply, language=pick_tts_lang(lang))
 
@@ -264,6 +327,7 @@ def process_command(node_name, audio_buffer):
         print(f"[{node_name}] STT Error: {e}")
 
 def listen_routine(node_name, host, port):
+    st = node_state(node_name)
     print(f"[{node_name}] Initializing Air-Gapped Ear on tcp:{host}:{port}...")
     
     # Load Models (Thread-safe?)
@@ -306,13 +370,17 @@ def listen_routine(node_name, host, port):
                 if not data or len(data) < CHUNK_BYTES:
                     print(f"[{node_name}] Stream ended/broken.")
                     break
-                
+
+                st['last_audio_ts'] = time.time()
+                st['stream_connected'] = True
+
                 # Check if worker is still processing
                 if worker and worker.is_alive():
                     continue
                 if worker and not worker.is_alive():
                     ow_model.reset()
                     worker = None
+                    st['busy'] = False
                     print(f"[{node_name}] Listening again.")
                 
                 # numpy for Wake Word
@@ -323,6 +391,7 @@ def listen_routine(node_name, host, port):
                     prediction = ow_model.predict(audio_np)
                     if prediction[WAKE_WORD_MODEL] > 0.5:
                         print(f"\n[{node_name}] >>> WAKE WORD DETECTED! <<<")
+                        emit(node_name, 'wake')
                         is_active = True
                         ow_model.reset()
                         silent_bytes = 0
@@ -360,6 +429,7 @@ def listen_routine(node_name, host, port):
                     
                     if should_process:
                         print(f"\n[{node_name}] Silence/Max Detected. Processing Command...")
+                        st['busy'] = True
                         worker = threading.Thread(target=process_command, args=(node_name, bytes(command_buffer)), daemon=True)
                         worker.start()
                         is_active = False
@@ -367,6 +437,7 @@ def listen_routine(node_name, host, port):
                         
         except Exception as e:
             print(f"[{node_name}] Stream Error: {e}")
+        st['stream_connected'] = False
         # Stream ended or failed: reap parecord and back off before reconnecting
         if process:
             process.terminate()

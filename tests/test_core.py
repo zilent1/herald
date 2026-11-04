@@ -2,7 +2,8 @@ import sys
 import os
 import json
 import tempfile
-from unittest.mock import MagicMock
+import queue
+from unittest.mock import MagicMock, call
 
 # --- Stub heavy dependencies BEFORE importing core ---
 sys.modules['torch'] = MagicMock()
@@ -262,3 +263,196 @@ def test_enroll_pattern_portuguese():
     m = core.ENROLL_PATTERN.search('Meu nome é Rafael')
     assert m is not None
     assert m.group(1) == 'Rafael'
+
+
+# ---------------------------------------------------------------------------
+# Event bus: emit / subscribe / unsubscribe
+# ---------------------------------------------------------------------------
+
+def test_emit_delivers_to_subscribed_queue():
+    """emit puts event on the subscribed queue."""
+    q = core.subscribe('TestNode')
+    try:
+        core.emit('TestNode', 'wake')
+        event = q.get_nowait()
+        assert event['stage'] == 'wake'
+        assert 'ts' in event
+    finally:
+        core.unsubscribe('TestNode', q)
+
+
+def test_emit_not_delivered_after_unsubscribe():
+    """After unsubscribe, emit no longer delivers to that queue."""
+    q = core.subscribe('TestNode')
+    core.unsubscribe('TestNode', q)
+    core.emit('TestNode', 'wake')
+    assert q.empty()
+
+
+def test_emit_wake_updates_last_wake_ts():
+    """emit('wake') updates node_state last_wake_ts."""
+    core.emit('TestNode', 'wake')
+    st = core.node_state('TestNode')
+    assert st['last_wake_ts'] > 0.0
+
+
+def test_emit_transcribed_updates_last_command_ts():
+    """emit('transcribed') updates node_state last_command_ts."""
+    core.emit('TestNode', 'transcribed', text='hello', lang='en')
+    st = core.node_state('TestNode')
+    assert st['last_command_ts'] > 0.0
+
+
+# ---------------------------------------------------------------------------
+# speak() return value and sink parameter
+# ---------------------------------------------------------------------------
+
+def test_speak_returns_true_on_success(monkeypatch):
+    """speak returns True when paplay succeeds on first attempt."""
+    monkeypatch.setitem(core.NODES, 'Node01', {'host': 'node01', 'port': '4713'})
+
+    def fake_run(args, env=None, timeout=None):
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        return mock_result
+
+    monkeypatch.setattr(core.subprocess, 'run', fake_run)
+    monkeypatch.setattr(core.time, 'sleep', MagicMock())
+
+    result = core.speak('Node01', 'hello', 'en')
+    assert result is True
+
+
+def test_speak_returns_false_when_all_attempts_fail(monkeypatch):
+    """speak returns False when all 3 paplay attempts fail."""
+    monkeypatch.setitem(core.NODES, 'Node01', {'host': 'node01', 'port': '4713'})
+
+    def fake_run(args, env=None, timeout=None):
+        mock_result = MagicMock()
+        mock_result.returncode = 1
+        return mock_result
+
+    monkeypatch.setattr(core.subprocess, 'run', fake_run)
+    monkeypatch.setattr(core.time, 'sleep', MagicMock())
+
+    result = core.speak('Node01', 'hello', 'en')
+    assert result is False
+
+
+def test_speak_uses_selftest_sink(monkeypatch):
+    """speak with sink='SelftestSink' uses --device=SelftestSink."""
+    monkeypatch.setitem(core.NODES, 'Node01', {'host': 'node01', 'port': '4713'})
+
+    run_calls = []
+
+    def fake_run(args, env=None, timeout=None):
+        run_calls.append(args)
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        return mock_result
+
+    monkeypatch.setattr(core.subprocess, 'run', fake_run)
+    monkeypatch.setattr(core.time, 'sleep', MagicMock())
+
+    core.speak('Node01', 'hello', 'en', sink='SelftestSink')
+    assert '--device=SelftestSink' in run_calls[0]
+
+
+def test_speak_emits_tts_sent(monkeypatch):
+    """speak emits tts_sent event with ok and sink."""
+    monkeypatch.setitem(core.NODES, 'Node01', {'host': 'node01', 'port': '4713'})
+
+    def fake_run(args, env=None, timeout=None):
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        return mock_result
+
+    monkeypatch.setattr(core.subprocess, 'run', fake_run)
+    monkeypatch.setattr(core.time, 'sleep', MagicMock())
+
+    q = core.subscribe('Node01')
+    try:
+        core.speak('Node01', 'hello', 'en')
+        event = q.get_nowait()
+        assert event['stage'] == 'tts_sent'
+        assert event['ok'] is True
+        assert event['sink'] == 'VirtualMicSink'
+    finally:
+        core.unsubscribe('Node01', q)
+
+
+# ---------------------------------------------------------------------------
+# query_llm(use_history=False)
+# ---------------------------------------------------------------------------
+
+def test_query_llm_no_history(monkeypatch):
+    """query_llm with use_history=False sends exactly 2 messages and leaves _history empty."""
+    core._history.clear()
+    captured_payloads = []
+
+    def fake_post(url, json=None, timeout=None):
+        captured_payloads.append(json)
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        resp.json.return_value = {'message': {'content': 'answer'}}
+        return resp
+
+    monkeypatch.setattr(core.requests, 'post', fake_post)
+
+    result = core.query_llm('Node01', 'test', use_history=False)
+    assert result == 'answer'
+
+    # Exactly 2 messages: system + user
+    assert len(captured_payloads[0]['messages']) == 2
+    assert captured_payloads[0]['messages'][0]['role'] == 'system'
+    assert captured_payloads[0]['messages'][1]['role'] == 'user'
+    assert captured_payloads[0]['messages'][1]['content'] == 'test'
+
+    # _history should be empty (no entry created for this node)
+    assert 'Node01' not in core._history
+
+    core._history.clear()
+
+
+# ---------------------------------------------------------------------------
+# process_command with selftest
+# ---------------------------------------------------------------------------
+
+def test_process_command_selftest_run(monkeypatch):
+    """process_command with a pending selftest run: skips speaker, uses use_history=False, sink=SelftestSink."""
+    monkeypatch.setitem(core.NODES, 'Node01', {'host': 'node01', 'port': '4713'})
+    monkeypatch.setattr(core, 'transcribe_audio', MagicMock(return_value=('what is two plus two', 'en')))
+    monkeypatch.setattr(core, 'query_llm', MagicMock(return_value='four'))
+    monkeypatch.setattr(core, 'speak', MagicMock())
+    monkeypatch.setattr(core, 'embed_speaker', MagicMock())
+    core._selftest_pending['Node01'] = {}
+
+    try:
+        core.process_command('Node01', b'\x00' * 32000)
+    finally:
+        core._selftest_pending.pop('Node01', None)
+
+    # query_llm called with use_history=False
+    core.query_llm.assert_called_once_with('Node01', 'what is two plus two', use_history=False)
+
+    # speak called with sink='SelftestSink'
+    core.speak.assert_called_once_with('Node01', 'four', language='en', sink='SelftestSink')
+
+    # embed_speaker never called
+    core.embed_speaker.assert_not_called()
+
+
+def test_process_command_transcribed_empty(monkeypatch):
+    """process_command emits 'transcribed' with empty text when transcription is empty."""
+    monkeypatch.setitem(core.NODES, 'Node01', {'host': 'node01', 'port': '4713'})
+    monkeypatch.setattr(core, 'transcribe_audio', MagicMock(return_value=('', 'en')))
+    monkeypatch.setattr(core, 'embed_speaker', MagicMock())
+
+    q = core.subscribe('Node01')
+    try:
+        core.process_command('Node01', b'\x00' * 32000)
+        event = q.get_nowait()
+        assert event['stage'] == 'transcribed'
+        assert event['text'] == ''
+    finally:
+        core.unsubscribe('Node01', q)
