@@ -43,6 +43,7 @@ Each node runs a full PulseAudio stack with virtual sinks:
 - `SpeakerOutput.monitor` — what Cortex records from (everything the Nest Mini hears)
 - `VirtualMicSink` — Cortex plays TTS here (`paplay --device=VirtualMicSink`, override with `TTS_SINK`)
 - `VirtualMic` — remapped source from `VirtualMicSink.monitor`; Chrome's microphone, so TTS goes into the call
+- `SelftestSink` — silent sink where self-test replies go (see Self-Test and Monitoring)
 
 Keeping TTS off `SpeakerOutput` means Cortex never records (and wakes on) its own voice. While a command is being processed, the node's incoming audio is drained and ignored.
 
@@ -76,6 +77,7 @@ herald/
 |   +-- client.conf            # PulseAudio client config
 +-- scripts/
 |   +-- generate_deployment.py # Generates docker-compose.yml from herald_nodes.json
+|   +-- herald_check.py        # Status/self-test CLI for cron and alerts
 +-- cookies/                   # Google session cookies (per node)
 +-- voice_sample/
 |   +-- reference.wav          # Voice clone source for TTS
@@ -245,6 +247,45 @@ curl -X POST http://localhost:5000/inject -d '{"node":"Node01", "text":"I see yo
 ```
 
 Errors: `400` missing `node`/`text`, `404` unknown node, `503` TTS not loaded.
+
+### Self-Test and Monitoring
+
+**Status.** `GET /status` aggregates the cortex engines, each node's audio stream and each node agent's own `/status` (port 8080 on `herald_net`: `starting` / `logging_in` / `logged_out` / `idle` / `in_call`, login failures, key-cookie expiry, PulseAudio sinks). The body's `ok` is `true` only when every node is logged in, its stream is live and all sinks exist.
+
+```bash
+curl -s http://localhost:5000/status | jq
+```
+
+Expired cookies show up as `"state": "logged_out"` with a growing `login_failures`. While idle, a node reloads the Meet page every `SESSION_CHECK_SECONDS` (default 1800) to notice a session Google revoked server-side; `days_to_expiry` only reflects the cookie file and cannot see that.
+
+**Pipeline self-test.** `POST /selftest` plays a stimulus ("Hey Jarvis." + "What is two plus two?") into the node's `SpeakerOutput`, exactly where the Nest Mini's audio arrives, and checks every stage: `stream`, `stimulus`, `wake`, `stt` (transcript contains a keyword), `llm`, `tts` (reply actually reached the sink). It does not need a call or valid cookies. The reply goes to the silent `SelftestSink`, so nothing is heard in the house during a live call; `"audible": true` uses the real `VirtualMicSink` instead. Self-test commands skip speaker identification and conversation history.
+
+```bash
+curl -s -X POST http://localhost:5000/selftest -d '{"node":"Node01"}' | jq
+```
+
+Returns `200` (pass) or `500` (fail) with per-stage `ok`, `t_ms` and `detail`; `409` if the node is busy, `404` unknown node, `503` TTS/Whisper not loaded. The stimulus is synthesized with XTTS on first use and cached in `speaker_data/selftest_stimulus.wav`. If the wake word does not fire on the synthetic voice, record your own ("Hey Jarvis … what is two plus two") and point `SELFTEST_STIMULUS` at it.
+
+| Variable | Default | Description |
+|---|---|---|
+| `SELFTEST_STIMULUS` | *(generated)* | WAV to play instead of the generated stimulus (path inside the cortex container) |
+| `SELFTEST_KEYWORDS` | `two,plus,dois,mais,four,2` | Transcript must contain one of these |
+| `SELFTEST_RMS_MIN` | `200` | Minimum reply loudness on the sink to count as sent |
+| `SESSION_CHECK_SECONDS` | `1800` | Idle session re-check interval on nodes |
+
+**CLI / cron.** `scripts/herald_check.py` (stdlib only) prints a summary and exits `0` OK, `1` pipeline failure, `2` session failure (e.g. cookies expired), `3` cortex unreachable. `--webhook URL` POSTs `{"text": …}` on failure (ntfy, Uptime Kuma push, …).
+
+```bash
+python3 scripts/herald_check.py                      # status only
+python3 scripts/herald_check.py --selftest           # + pipeline self-test on every node
+```
+
+```cron
+*/5 * * * * cd /path/to/herald && python3 scripts/herald_check.py --webhook https://ntfy.sh/herald-xyz
+0 * * * *   cd /path/to/herald && python3 scripts/herald_check.py --selftest --webhook https://ntfy.sh/herald-xyz
+```
+
+Not covered: the Nest Mini itself (speaker/mic) and the ESP redial; answering a real Meet call still needs a manual test.
 
 ### View Logs
 
