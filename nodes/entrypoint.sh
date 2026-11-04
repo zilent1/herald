@@ -35,6 +35,7 @@ echo "[ENTRYPOINT] Configuring sinks..."
 # Doing it here ensures it's done before app starts.
 pactl load-module module-null-sink sink_name=SpeakerOutput sink_properties=device.description=SpeakerOutput || true
 pactl load-module module-null-sink sink_name=VirtualMicSink sink_properties=device.description=VirtualMicSink || true
+pactl load-module module-null-sink sink_name=SelftestSink sink_properties=device.description=SelftestSink || true
 pactl load-module module-remap-source master=VirtualMicSink.monitor source_name=VirtualMic source_properties=device.description=VirtualMic || true
 pactl set-default-sink SpeakerOutput || true
 pactl set-default-source VirtualMic || true

@@ -45,6 +45,13 @@ _state_lock = threading.Lock()
 _listeners = {}  # node -> list of queue.Queue
 _selftest_pending = {}  # node -> run dict
 SELFTEST_SINK = os.getenv('SELFTEST_SINK', 'SelftestSink')
+SELFTEST_STIMULUS = os.getenv('SELFTEST_STIMULUS', '')
+SELFTEST_CACHE = os.getenv('SELFTEST_CACHE', '/app/data/selftest_stimulus.wav')
+SELFTEST_WAKE_TEXT = os.getenv('SELFTEST_WAKE_TEXT', 'Hey Jarvis.')
+SELFTEST_COMMAND_TEXT = os.getenv('SELFTEST_COMMAND_TEXT', 'What is two plus two?')
+SELFTEST_KEYWORDS = [w.strip().lower() for w in os.getenv('SELFTEST_KEYWORDS', 'two,plus,dois,mais,four,2').split(',') if w.strip()]
+SELFTEST_RMS_MIN = float(os.getenv('SELFTEST_RMS_MIN', '200'))
+STREAM_STALE_SECONDS = float(os.getenv('STREAM_STALE_SECONDS', '10'))
 
 def node_state(node_name):
     with _state_lock:
@@ -456,6 +463,203 @@ def main():
 
     app.run(host='0.0.0.0', port=5000)
 
+# --- Self-test ---
+
+def get_stimulus():
+    """Return path to stimulus WAV file, generating it if needed."""
+    if SELFTEST_STIMULUS and os.path.exists(SELFTEST_STIMULUS):
+        return SELFTEST_STIMULUS
+    if os.path.exists(SELFTEST_CACHE):
+        return SELFTEST_CACHE
+    if tts_engine is None:
+        raise RuntimeError("tts_engine is None and no stimulus file exists")
+    with tts_lock:
+        fd1, tmp1 = tempfile.mkstemp(suffix='.wav')
+        os.close(fd1)
+        tts_engine.tts_to_file(text=SELFTEST_WAKE_TEXT, speaker_wav=VOICE_REF, language='en', file_path=tmp1)
+        fd2, tmp2 = tempfile.mkstemp(suffix='.wav')
+        os.close(fd2)
+        tts_engine.tts_to_file(text=SELFTEST_COMMAND_TEXT, speaker_wav=VOICE_REF, language='en', file_path=tmp2)
+    os.makedirs(os.path.dirname(SELFTEST_CACHE), exist_ok=True)
+    with wave.open(tmp1, 'rb') as w1:
+        rate, width, channels = w1.getframerate(), w1.getsampwidth(), w1.getnchannels()
+        wake_frames = w1.readframes(w1.getnframes())
+    with wave.open(tmp2, 'rb') as w2:
+        cmd_frames = w2.readframes(w2.getnframes())
+    silence = b'\x00' * int(rate * 0.8) * channels * width
+    with wave.open(SELFTEST_CACHE, 'wb') as wf:
+        wf.setnchannels(channels)
+        wf.setsampwidth(width)
+        wf.setframerate(rate)
+        wf.writeframes(wake_frames + silence + cmd_frames)
+    os.remove(tmp1)
+    os.remove(tmp2)
+    return SELFTEST_CACHE
+
+
+class MonitorRecorder:
+    def __init__(self, node_name, source):
+        self.node_name = node_name
+        self.source = source
+        self.max_rms = 0.0
+        self._process = None
+        self._thread = None
+
+    def start(self):
+        node = NODES[self.node_name]
+        env = os.environ.copy()
+        env['PULSE_SERVER'] = f"tcp:{node['host']}:{node['port']}"
+        self._process = subprocess.Popen(
+            ['parecord', '--raw', '--rate=16000', '--channels=1', '--format=s16le', f'--device={self.source}'],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env
+        )
+        self._thread = threading.Thread(target=self._read_loop, daemon=True)
+        self._thread.start()
+
+    def _read_loop(self):
+        while True:
+            data = self._process.stdout.read(3200)
+            if not data:
+                break
+            x = np.frombuffer(data, dtype=np.int16).astype(np.float64)
+            rms = float(np.sqrt(np.mean(x ** 2)))
+            if rms > self.max_rms:
+                self.max_rms = rms
+
+    def stop(self):
+        if self._process:
+            try:
+                self._process.terminate()
+            except Exception:
+                pass
+            self._process.wait()
+        if self._thread:
+            self._thread.join(timeout=2)
+        return self.max_rms
+
+
+def evaluate(run):
+    """Pure function: evaluate selftest run results. Returns (ok, stages)."""
+    started = run['started']
+    stream_age = run['stream_age']
+    events = run['events']
+    rms = run['rms']
+    played = run['played']
+
+    def _t_ms(event):
+        if event is None:
+            return None
+        return int((event['ts'] - started) * 1000)
+
+    stages = {}
+
+    # stream
+    if stream_age is None:
+        stages['stream'] = {'ok': False, 't_ms': None, 'detail': 'no audio'}
+    else:
+        stages['stream'] = {'ok': stream_age <= STREAM_STALE_SECONDS, 't_ms': None, 'detail': f'last audio {stream_age:.1f}s ago'}
+
+    # stimulus
+    stages['stimulus'] = {'ok': played, 't_ms': None, 'detail': 'ok' if played else 'playback failed'}
+
+    # wake
+    wake_evt = next((e for e in events if e['stage'] == 'wake'), None)
+    stages['wake'] = {'ok': wake_evt is not None, 't_ms': _t_ms(wake_evt), 'detail': 'ok' if wake_evt else 'no event'}
+
+    # stt
+    transcribed_evt = next((e for e in events if e['stage'] == 'transcribed'), None)
+    if transcribed_evt is None:
+        stages['stt'] = {'ok': False, 't_ms': None, 'detail': 'no event'}
+    else:
+        text = transcribed_evt.get('text', '')
+        text_lower = text.lower()
+        ok = bool(text) and any(kw in text_lower for kw in SELFTEST_KEYWORDS)
+        stages['stt'] = {'ok': ok, 't_ms': _t_ms(transcribed_evt), 'detail': text}
+
+    # llm
+    llm_evt = next((e for e in events if e['stage'] == 'llm'), None)
+    if llm_evt is None:
+        stages['llm'] = {'ok': False, 't_ms': None, 'detail': 'no event'}
+    else:
+        reply = llm_evt.get('reply', '')
+        ok = bool(reply) and reply != 'Cognitive failure.'
+        stages['llm'] = {'ok': ok, 't_ms': _t_ms(llm_evt), 'detail': reply[:120]}
+
+    # tts
+    tts_evt = next((e for e in events if e['stage'] == 'tts_sent' and e.get('ok')), None)
+    if tts_evt is None:
+        stages['tts'] = {'ok': False, 't_ms': None, 'detail': 'no event'}
+    else:
+        ok = rms >= SELFTEST_RMS_MIN
+        stages['tts'] = {'ok': ok, 't_ms': _t_ms(tts_evt), 'detail': f'paplay ok, rms {int(rms)}'}
+
+    overall_ok = all(s['ok'] for s in stages.values())
+    return overall_ok, stages
+
+
+def run_selftest(node_name, audible=False, timeout=120.0):
+    """Run a full pipeline self-test on a node."""
+    st = node_state(node_name)
+    stream_age = time.time() - st['last_audio_ts'] if st['last_audio_ts'] else None
+    sink = TTS_SINK if audible else SELFTEST_SINK
+    q = subscribe(node_name)
+    run = {'audible': audible}
+    _selftest_pending[node_name] = run
+    recorder = MonitorRecorder(node_name, f'{sink}.monitor')
+    events = []
+    started = time.time()
+    played = False
+
+    try:
+        recorder.start()
+        stimulus = get_stimulus()
+        node = NODES[node_name]
+        env = os.environ.copy()
+        env['PULSE_SERVER'] = f"tcp:{node['host']}:{node['port']}"
+        try:
+            played = subprocess.run(['paplay', '--device=SpeakerOutput', stimulus], env=env, timeout=60).returncode == 0
+        except Exception:
+            played = False
+
+        if played:
+            deadline = time.time() + timeout  # count from end of playback (first run also generates the stimulus)
+            while True:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    break
+                try:
+                    evt = q.get(timeout=remaining)
+                except queue.Empty:
+                    break
+                events.append(evt)
+                if evt['stage'] == 'tts_sent':
+                    break
+                if evt['stage'] == 'transcribed' and not evt.get('text'):
+                    break
+    finally:
+        rms = recorder.stop()
+        unsubscribe(node_name, q)
+        _selftest_pending.pop(node_name, None)
+
+    ok, stages = evaluate({
+        'started': started,
+        'stream_age': stream_age,
+        'events': events,
+        'rms': rms,
+        'played': played,
+    })
+    result = {
+        'ok': ok,
+        'node': node_name,
+        'audible': audible,
+        'started': started,
+        'duration_ms': int((time.time() - started) * 1000),
+        'stages': stages,
+    }
+    st['last_selftest'] = result
+    return result
+
+
 # Flask app at module level
 app = Flask(__name__)
 
@@ -477,6 +681,23 @@ def inject():
         return jsonify(error='tts engine unavailable'), 503
     threading.Thread(target=speak, args=(node, text, pick_tts_lang(lang)), daemon=True).start()
     return jsonify(status='queued'), 202
+
+@app.route('/selftest', methods=['POST'])
+def selftest():
+    data = request.get_json(force=True, silent=True) or {}
+    node = data.get('node')
+    if not node:
+        return jsonify(error='missing node'), 400
+    if node not in NODES:
+        return jsonify(error='unknown node'), 404
+    if tts_engine is None or whisper_model is None:
+        return jsonify(error='engine unavailable'), 503
+    if node_state(node)['busy'] or node in _selftest_pending:
+        return jsonify(error='busy'), 409
+    audible = data.get('audible', False)
+    timeout = data.get('timeout', 120.0)
+    result = run_selftest(node, audible=audible, timeout=timeout)
+    return jsonify(result), 200 if result['ok'] else 500
 
 if __name__ == "__main__":
     main()

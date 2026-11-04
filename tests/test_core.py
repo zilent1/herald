@@ -3,6 +3,7 @@ import os
 import json
 import tempfile
 import queue
+import time
 from unittest.mock import MagicMock, call
 
 # --- Stub heavy dependencies BEFORE importing core ---
@@ -456,3 +457,203 @@ def test_process_command_transcribed_empty(monkeypatch):
         assert event['text'] == ''
     finally:
         core.unsubscribe('Node01', q)
+
+
+# ---------------------------------------------------------------------------
+# evaluate()
+# ---------------------------------------------------------------------------
+
+def _make_run(events=None, started=None, stream_age=1.0, rms=500.0, played=True):
+    if started is None:
+        started = time.time()
+    return {
+        'started': started,
+        'stream_age': stream_age,
+        'events': events or [],
+        'rms': rms,
+        'played': played,
+    }
+
+
+def test_evaluate_all_ok():
+    """evaluate with a complete good run -> ok True and all 6 stages ok in order."""
+    started = time.time()
+    events = [
+        {'stage': 'wake', 'ts': started + 0.1},
+        {'stage': 'transcribed', 'ts': started + 1.0, 'text': 'What is two plus two?', 'lang': 'en'},
+        {'stage': 'llm', 'ts': started + 2.0, 'reply': 'Four.'},
+        {'stage': 'tts_sent', 'ts': started + 3.0, 'ok': True, 'sink': 'SelftestSink'},
+    ]
+    run = _make_run(events=events, started=started, stream_age=0.5, rms=500.0, played=True)
+    ok, stages = core.evaluate(run)
+    assert ok is True
+    assert list(stages.keys()) == ['stream', 'stimulus', 'wake', 'stt', 'llm', 'tts']
+    for s in stages.values():
+        assert s['ok'] is True
+
+
+def test_evaluate_no_events():
+    """evaluate with no events -> wake/stt/llm/tts not ok with detail 'no event'."""
+    run = _make_run(events=[], stream_age=1.0, played=True)
+    ok, stages = core.evaluate(run)
+    assert ok is False
+    assert stages['wake']['ok'] is False
+    assert stages['wake']['detail'] == 'no event'
+    assert stages['stt']['ok'] is False
+    assert stages['stt']['detail'] == 'no event'
+    assert stages['llm']['ok'] is False
+    assert stages['llm']['detail'] == 'no event'
+    assert stages['tts']['ok'] is False
+    assert stages['tts']['detail'] == 'no event'
+
+
+def test_evaluate_stt_no_keyword():
+    """evaluate stt fails when text has no keyword."""
+    started = time.time()
+    events = [
+        {'stage': 'wake', 'ts': started + 0.1},
+        {'stage': 'transcribed', 'ts': started + 1.0, 'text': 'hello world', 'lang': 'en'},
+    ]
+    run = _make_run(events=events, started=started, stream_age=1.0, played=True)
+    ok, stages = core.evaluate(run)
+    assert ok is False
+    assert stages['stt']['ok'] is False
+
+
+def test_evaluate_llm_cognitive_failure():
+    """evaluate llm fails on 'Cognitive failure.'."""
+    started = time.time()
+    events = [
+        {'stage': 'wake', 'ts': started + 0.1},
+        {'stage': 'transcribed', 'ts': started + 1.0, 'text': 'two plus two', 'lang': 'en'},
+        {'stage': 'llm', 'ts': started + 2.0, 'reply': 'Cognitive failure.'},
+    ]
+    run = _make_run(events=events, started=started, stream_age=1.0, played=True)
+    ok, stages = core.evaluate(run)
+    assert ok is False
+    assert stages['llm']['ok'] is False
+
+
+def test_evaluate_tts_rms_below_min():
+    """evaluate tts fails when rms below SELFTEST_RMS_MIN."""
+    started = time.time()
+    events = [
+        {'stage': 'wake', 'ts': started + 0.1},
+        {'stage': 'transcribed', 'ts': started + 1.0, 'text': 'two plus two', 'lang': 'en'},
+        {'stage': 'llm', 'ts': started + 2.0, 'reply': 'Four.'},
+        {'stage': 'tts_sent', 'ts': started + 3.0, 'ok': True, 'sink': 'SelftestSink'},
+    ]
+    run = _make_run(events=events, started=started, stream_age=1.0, rms=100.0, played=True)
+    ok, stages = core.evaluate(run)
+    assert ok is False
+    assert stages['tts']['ok'] is False
+
+
+def test_evaluate_stream_none():
+    """evaluate stream fails when stream_age is None."""
+    run = _make_run(events=[], stream_age=None, played=True)
+    ok, stages = core.evaluate(run)
+    assert ok is False
+    assert stages['stream']['ok'] is False
+    assert stages['stream']['detail'] == 'no audio'
+
+
+# ---------------------------------------------------------------------------
+# /selftest endpoint
+# ---------------------------------------------------------------------------
+
+def test_selftest_missing_node():
+    """POST /selftest without node -> 400."""
+    app = core.app.test_client()
+    resp = app.post('/selftest', json={})
+    assert resp.status_code == 400
+
+
+def test_selftest_unknown_node():
+    """POST /selftest with unknown node -> 404."""
+    app = core.app.test_client()
+    resp = app.post('/selftest', json={"node": "Nope"})
+    assert resp.status_code == 404
+
+
+def test_selftest_engine_unavailable(monkeypatch):
+    """POST /selftest when whisper_model is None -> 503."""
+    monkeypatch.setitem(core.NODES, 'Node01', {'host': 'node01', 'port': '4713'})
+    monkeypatch.setattr(core, 'whisper_model', None)
+    monkeypatch.setattr(core, 'tts_engine', MagicMock())
+
+    app = core.app.test_client()
+    resp = app.post('/selftest', json={"node": "Node01"})
+    assert resp.status_code == 503
+
+
+def test_selftest_busy(monkeypatch):
+    """POST /selftest when node is busy -> 409."""
+    monkeypatch.setitem(core.NODES, 'Node01', {'host': 'node01', 'port': '4713'})
+    monkeypatch.setattr(core, 'tts_engine', MagicMock())
+    monkeypatch.setattr(core, 'whisper_model', MagicMock())
+    core.node_state('Node01')['busy'] = True
+
+    try:
+        app = core.app.test_client()
+        resp = app.post('/selftest', json={"node": "Node01"})
+        assert resp.status_code == 409
+    finally:
+        core.node_state('Node01')['busy'] = False
+
+
+def test_selftest_success(monkeypatch):
+    """POST /selftest with run_selftest returning ok -> 200."""
+    monkeypatch.setitem(core.NODES, 'Node01', {'host': 'node01', 'port': '4713'})
+    monkeypatch.setattr(core, 'tts_engine', MagicMock())
+    monkeypatch.setattr(core, 'whisper_model', MagicMock())
+    monkeypatch.setattr(core, 'run_selftest', MagicMock(return_value={'ok': True, 'node': 'Node01', 'stages': {}}))
+
+    app = core.app.test_client()
+    resp = app.post('/selftest', json={"node": "Node01"})
+    assert resp.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# run_selftest
+# ---------------------------------------------------------------------------
+
+def test_run_selftest_full(monkeypatch):
+    """run_selftest with monkeypatched subprocess.run/get_stimulus/MonitorRecorder -> ok True, cleanup verified."""
+    monkeypatch.setitem(core.NODES, 'Node01', {'host': 'node01', 'port': '4713'})
+    # Set last_audio_ts so stream_age is fresh
+    st = core.node_state('Node01')
+    st['last_audio_ts'] = time.time()
+
+    monkeypatch.setattr(core, 'get_stimulus', MagicMock(return_value='/fake/stimulus.wav'))
+
+    class FakeRecorder:
+        def __init__(self, node_name, source):
+            pass
+        def start(self):
+            pass
+        def stop(self):
+            return 1000.0
+
+    monkeypatch.setattr(core, 'MonitorRecorder', FakeRecorder)
+
+    def fake_run(args, env=None, timeout=None):
+        # Simulate the pipeline events
+        core.emit('Node01', 'wake')
+        core.emit('Node01', 'transcribed', text='two plus two', lang='en')
+        core.emit('Node01', 'llm', reply='Four.')
+        core.emit('Node01', 'tts_sent', ok=True, sink='SelftestSink')
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        return mock_result
+
+    monkeypatch.setattr(core.subprocess, 'run', fake_run)
+
+    result = core.run_selftest('Node01')
+
+    assert result['ok'] is True
+    assert result['node'] == 'Node01'
+    # Cleanup: node not in _selftest_pending
+    assert 'Node01' not in core._selftest_pending
+    # _listeners for that node is empty
+    assert core._listeners.get('Node01', []) == []
