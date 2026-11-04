@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import subprocess
 import threading
 import time
@@ -238,6 +239,20 @@ def monitor_connection(driver):
             print(f"[{NODE_NAME}] [Watchdog Error] {e}")
             time.sleep(5)
 
+def chrome_major_version():
+    env_val = os.getenv('CHROME_VERSION_MAIN')
+    if env_val:
+        return int(env_val)
+    try:
+        r = subprocess.run(['google-chrome', '--version'], capture_output=True, text=True, timeout=10)
+        m = re.search(r'(\d+)\.\d+', r.stdout)
+        if m:
+            return int(m.group(1))
+    except Exception:
+        pass
+    return None
+
+
 def main():
     start_status_server()
     print(f"[{NODE_NAME}] [RED.PHONE] Receiver Online. Loading Profile from {PROFILE_PATH}...")
@@ -262,8 +277,9 @@ def main():
     # Use Xvfb display
     # (Env var DISPLAY=:99 is set in Dockerfile, but good to be explicit if needed, standard chrome uses it automatically)
 
-    print(f"[{NODE_NAME}] Launching Chrome...")
-    driver = uc.Chrome(options=opts, version_main=None)
+    chrome_ver = chrome_major_version()
+    print(f"[{NODE_NAME}] Launching Chrome (version_main={chrome_ver})...")
+    driver = uc.Chrome(options=opts, version_main=chrome_ver)
     
     try:
         ensure_session(driver)

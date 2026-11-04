@@ -326,3 +326,22 @@ class TestStatusHttp:
         finally:
             server.shutdown()
             server.server_close()
+
+
+class TestChromeMajorVersion:
+    def test_env_override(self, monkeypatch):
+        monkeypatch.setenv('CHROME_VERSION_MAIN', '156')
+        assert agent.chrome_major_version() == 156
+
+    def test_parse_version_string(self, monkeypatch):
+        monkeypatch.delenv('CHROME_VERSION_MAIN', raising=False)
+        monkeypatch.setattr(agent.subprocess, 'run',
+            lambda *a, **kw: types.SimpleNamespace(stdout='Google Chrome 156.0.8078.79\n'))
+        assert agent.chrome_major_version() == 156
+
+    def test_exception_returns_none(self, monkeypatch):
+        monkeypatch.delenv('CHROME_VERSION_MAIN', raising=False)
+        def _raise(*a, **kw):
+            raise FileNotFoundError
+        monkeypatch.setattr(agent.subprocess, 'run', _raise)
+        assert agent.chrome_major_version() is None
